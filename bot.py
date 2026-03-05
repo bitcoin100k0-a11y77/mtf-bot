@@ -1,5 +1,5 @@
 """
-MTF Scalping Bot — Railway Cloud Deployment
+MTF Scalping Bot - Railway Cloud Deployment
 Strategy : 30M EMA9 trend filter + 5M EMA21 pullback entry
            RSI(14) bounce/reject + ATR chop filter
 Data     : Binance public API (no key needed)
@@ -14,27 +14,27 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("MTFBot")
 
 class Cfg:
-    TG_TOKEN  = os.getenv("TELEGRAM_TOKEN", "")
+    TG_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
     TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-    TF_EMA = 9
-    M5_EMA = 21
-    RSI_P = 14
-    ATR_P = 14
-    PULL_PCT = 0.007
-    SL_MULT = 1.5
-    TP_MULT = 3.5
-    MAX_HOLD = 48
-    RSI_LO = 40.0
-    RSI_HI = 60.0
-    RSI_FLOOR = 25.0
-    RSI_CEIL = 75.0
-    ATR_REL = 0.90
-    ATR_AVG_N = 100
-    IC = 10_000.0
-    RISK_PCT = 0.0075
-    INTERVAL = 300
-    URL_5M = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=600"
-    URL_30M = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=30m&limit=500"
+    TF_EMA     = 9
+    M5_EMA     = 21
+    RSI_P      = 14
+    ATR_P      = 14
+    PULL_PCT   = 0.007
+    SL_MULT    = 1.5
+    TP_MULT    = 3.5
+    MAX_HOLD   = 48
+    RSI_LO     = 40.0
+    RSI_HI     = 60.0
+    RSI_FLOOR  = 25.0
+    RSI_CEIL   = 75.0
+    ATR_REL    = 0.90
+    ATR_AVG_N  = 100
+    IC         = 10_000.0
+    RISK_PCT   = 0.0075
+    INTERVAL   = 300
+    URL_5M     = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=600"
+    URL_30M    = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=30m&limit=500"
     STATE_FILE = Path(os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "/data")) / "bot_state.json"
 
 def load_state():
@@ -107,12 +107,12 @@ def fetch_klines(url):
 
 def build(raw5m, raw30m):
     def parse(raw):
-        o,h.l,c,ts = [],[],[],[],[]
+        o, h, l, c, ts = [], [], [], [], []
         for k in raw:
             ts.append(int(k[0]) / 1000)
             o.append(float(k[1])); h.append(float(k[2]))
             l.append(float(k[3])); c.append(float(k[4]))
-        return {"o":o,"h":h,"l":l,"c":c,"ts":ts}
+        return {"o": o, "h": h, "l": l, "c": c, "ts": ts}
     d5 = parse(raw5m); d30 = parse(raw30m)
     d30["e9"] = calc_ema(d30["c"], Cfg.TF_EMA)
     e9p = [None] + d30["e9"][:-1]
@@ -147,18 +147,18 @@ def get_signal(d5, capital):
     bull = c > o and body > 0.45
     bear = c < o and body > 0.45
     tr_d = "UP" if d5["tf_up"][i] else ("DOWN" if d5["tf_dn"][i] else "FLAT")
-    m = {"px":c, "e21":d5["e21"][i], "tf_e9":d5["tf_e9"][i], "rsi":rc, "atr":atr, "ar":ar, "tr":tr_d, "near":near, "dist":dist}
-    if ar is not None and ar < Cfg.ATR_REL: return {"sig":"CHOP", "reason":f"ATR {ar:.2f}x < {Cfg.ATR_REL}", "m":m}
+    m = {"px": c, "e21": d5["e21"][i], "tf_e9": d5["tf_e9"][i], "rsi": rc, "atr": atr, "ar": ar, "tr": tr_d, "near": near, "dist": dist}
+    if ar is not None and ar < Cfg.ATR_REL: return {"sig": "CHOP", "reason": f"ATR {ar:.2f}x < {Cfg.ATR_REL}", "m": m}
     if d5["tf_up"][i] and near and rp < Cfg.RSI_LO and rc > rp and rc > Cfg.RSI_FLOOR and bull:
         sl = c - atr * Cfg.SL_MULT; tp = c + atr * Cfg.TP_MULT; sz = (capital * Cfg.RISK_PCT) / (atr * Cfg.SL_MULT)
-        return {"sig":"LONG", "reason":f"30M-UP EMA9 + EMA21 + RSI {rp:.0f}->{rc:.0f}", "m":m, "sl":sl, "tp":tp, "sz":sz}
+        return {"sig": "LONG", "reason": f"30M-UP EMA9 + EMA21 + RSI {rp:.0f}->{rc:.0f}", "m": m, "sl": sl, "tp": tp, "sz": sz}
     if d5["tf_dn"][i] and near and rp > Cfg.RSI_HI and rc < rp and rc < Cfg.RSI_CEIL and bear:
         sl = c + atr * Cfg.SL_MULT; tp = c - atr * Cfg.TP_MULT; sz = (capital * Cfg.RISK_PCT) / (atr * Cfg.SL_MULT)
-        return {"sig":"SHORT", "reason":f"30M-DOWN EMA9 + EMA21 + RSI {rp:.0f}->{rc:.0f}", "m":m, "sl":sl, "tp":tp, "sz":sz}
+        return {"sig": "SHORT", "reason": f"30M-DOWN EMA9 + EMA21 + RSI {rp:.0f}->{rc:.0f}", "m": m, "sl": sl, "tp": tp, "sz": sz}
     reason = f"30M:{tr_d}"
     if not near: reason += f" | dist {dist*100:.3f}% (need <0.7%)"
     else: reason += f" | RSI:{rc:.0f} bull:{bull} bear:{bear}"
-    return {"sig":"WATCH", "reason":reason, "m":m}
+    return {"sig": "WATCH", "reason": reason, "m": m}
 
 def check_exit(ot, d5):
     i = len(d5["ts"]) - 1
@@ -181,7 +181,7 @@ def tg_send(text):
     if not Cfg.TG_TOKEN or not Cfg.TG_CHAT_ID:
         log.info(f"[TG skipped] {text[:80]}"); return
     try:
-        requests.post(f"https://api.telegram.org/bot{Cfg.TG_TOKEN}/sendMessage", json={"chat_id":Cfg.TG_CHAT_ID,"text":text,"parse_mode":"HTML"}, timeout=10)
+        requests.post(f"https://api.telegram.org/bot{Cfg.TG_TOKEN}/sendMessage", json={"chat_id": Cfg.TG_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=10)
     except Exception as e: log.warning(f"Telegram error: {e}")
 
 def tg_trade_opened(ot):
@@ -189,8 +189,9 @@ def tg_trade_opened(ot):
     tg_send(f"<b>{emoji} OPENED</b>\nEntry: ${ot['entry']:,.2f}\nTP: ${ot['tp']:,.2f}\nSL: ${ot['sl']:,.2f}\nSize: {ot['size']:.4f} BTC\nReason: {ot['reason']}")
 
 def tg_trade_closed(t, capital):
-    emoji = "WIJ" if t["pnl"] > 0 else "LOSS"
-    tg_send(f"<b>{emoji} {t['reason']} {t['dir']} CLOSED</b>\nEntry: ${t['entry']:,.2f}\nExit: ${t['exit']:,.2f}\nP&L: {+'if t['pnl']>=0 else ''}${t['pnl']:,.2f}\nCapital: ${capital:,.2f}")
+    emoji = "WIN" if t["pnl"] > 0 else "LOSS"
+    sign = "+" if t["pnl"] >= 0 else ""
+    tg_send(f"<b>{emoji} {t['reason']} {t['dir']} CLOSED</b>\nEntry: ${t['entry']:,.2f}\nExit: ${t['exit']:,.2f}\nP&L: {sign}${t['pnl']:,.2f}\nCapital: ${capital:,.2f}")
 
 def tg_heartbeat(S, m):
     ret = (S["capital"] - Cfg.IC) / Cfg.IC * 100
@@ -223,8 +224,7 @@ def main():
             result = get_signal(d5, S["capital"])
             m = result.get("m", {})
             sig = result["sig"]
-            log.info(f"BTC ${px:,
-.0f} | 30M:{m.get('tr','?')} | RSI:{m.get('rsi',0):.1f} | ATR:{m.get('ar',0):.2f}x | Dist:{m.get('dist',0)*100:.3f}% | {sig}")
+            log.info(f"BTC ${px:,.0f} | 30M:{m.get('tr','?')} | RSI:{m.get('rsi',0):.1f} | ATR:{m.get('ar',0):.2f}x | Dist:{m.get('dist',0)*100:.3f}% | {sig}")
             if not S["open_trade"]:
                 if sig == "CHOP": S["chops"] += 1
                 elif sig in ("LONG", "SHORT"):
