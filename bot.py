@@ -106,12 +106,12 @@ def calc_rsi(closes, period=14):
     return out
 
 def calc_atr(highs, lows, closes, period=14):
-    tr = [None]*len(highs)
-    for i in range(1, len(highs)):
+    tr = [None]*len highs)
+    for i in range(1, len highs)):
         tr[i] = max(highs[i]-lows[i],
                     abs(highs[i]-closes[i-1]),
                     abs(lows[i] -closes[i-1]))
-    out = [None]*len highs); s = n = 0
+    out = [None]*len(highs); s = n = 0
     for i in range(1, len(tr)):
         if tr[i] is None: continue
         if n < period:
@@ -250,3 +250,348 @@ def build(raw5m, raw15m, raw1h):
                   for t in d5["ts"]]
 
     return d5
+
+
+# ─── Signal ───────────────────────────────────────────────────────────────────
+
+def get_signal(d5, capital):
+    n = len(d5["ts"])
+    i, p = n-2, n-3
+    if i < 120 or d5["atr"][i] is None or d5["rsi"][i] is None:
+        return {"sig": "WATCH", "reason": "warming up"}
+
+    c  = d5["c"][i]; o = d5["o"][i]
+    h  = d5["h"][i]; l = d5["l"][i]
+    rc = d5["rsi"][i]
+    rp = d5["rsi"][i-1] if d5["rsi"][i-1] else rc
+    atr_val   = d5["atr"][i]
+    atr_avg   = d5["atr_avg"][i]
+    ar        = atr_val/atr_avg if atr_avg else None
+    dist      = d5["dist"][i]   if d5["dist"][i] else 999
+    rsi_1h    = d5["rsi_1h"][i]
+    hour      = d5["hour"][i]
+    rsi_rise  = d5["rsi_rising"][i]
+    rsi_fall  = d5["rsi_falling"][i]
+
+    m = {"px":c,"e21":d5["e21"][i],"rsi":rc,"atr":atr_val,
+         "ar":ar,"hour":hour,"rsi_1h":rsi_1h}
+
+    # ── Chop filter ──────────────────────────────────────────────────────
+    if ar is None or ar < Cfg.ATR_REL:
+        return {"sig": "CHOP", "reason": f"ATR {ar:.2f}x" if ar else "ATR N/A", "m": m}
+
+    # ── Session filter (v3) ───────────────────────────────────────────────
+    if not (Cfg.SESSION_START <= hour < Cfg.SESSION_END):
+        return {"sig": "WATCH", "reason": f"off-session {hour}:xx UTC", "m": m}
+
+    # ── Candle quality ────────────────────────────────────────────────────
+    rng  = h - l
+    body = abs(c-o)/rng if rng > 0 else 0
+    bull = c > o and body > 0.45
+    bear = c < o and body > 0.45
+
+    # ── Distance filter ──────────────────────────────────────────────────
+    near = dist < Cfg.PULL_PCT
+
+    tr_d = "UP" if d5["tf_up"][i] else ("DOWN" if d5["tf_dn"][i] else "FLAT")
+
+    # ── LONG signal ───────────────────────────────────────────────────────
+    if (d5["tf_up"][i]
+            and near
+            and rp < Cfg.RSI_LO and rc > rp       # RSI turning up from below 45
+            and rc > Cfg.RSI_FLOOR
+            and bull
+            and rsi_rise                             # ← v3: RSI rising 2 bars
+            and (rsi_1h is None or rsi_1h > Cfg.RSI_1H_LO)):  # ← v3: 1H filter
+        sl  = c - atr_val * Cfg.SL_MULT
+        tp1 = c + atr_val * Cfg.TP1_MULT
+        tp2 = c + atr_val * Cfg.TP2_MULT
+        tp3 = c + atr_val * Cfg.TP3_MULT
+        be  = c + atr_val * Cfg.SL_MULT
+        sz  = (capital * Cfg.RISK_PCT) / (atr_val * Cfg.SL_MULT)
+        return {"sig": "LONG",
+                "reason": f"15M-UP EMA+RSI {rp:.0f}→{rc:.0f}",
+                "m": m, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
+                "be": be, "sz": sz}
+
+    # ── SHORT signal ──────────────────────────────────────────────────────
+    if (d5["tf_dn"][i]
+            and near
+            and rp > Cfg.RSI_HI and rc < rp        # RSI turning down from above 60
+            and rc < Cfg.RSI_CEIL
+            and bear
+            and rsi_fall                             # ← v3: RSI falling 2 bars
+            and (rsi_1h is None or rsi_1h < Cfg.RSI_1H_HI)):  # ← v3: 1H filter
+        sl  = c + atr_val * Cfg.SL_MULT
+        tp1 = c - atr_val * Cfg.TP1_MULT
+        tp2 = c - atr_val * Cfg.TP2_MULT
+        tp3 = c - atr_val * Cfg.TP3_MULT
+        be  = c - atr_val * Cfg.SL_MULT
+        sz  = (capital * Cfg.RISK_PCT) / (atr_val * Cfg.SL_MULT)
+        return {"sig": "SHORT",
+                "reason": f"15M-DOWN EMA+RSI {rp:.0f}→{rc:.0f}",
+                "m": m, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
+                "be": be, "sz": sz}
+
+    reason = f"15M:{tr_d}"
+    if not near: reason += f" | dist {dist*100:.3f}%"
+    else:        reason += f" | RSI:{rc:.0f}"
+    if not (Cfg.SESSION_START <= hour < Cfg.SESSION_END):
+        reason += f" | off-session"
+    return {"sig": "WATCH", "reason": reason, "m": m}
+
+
+# ─── Exit check (partial TPs + breakeven) ─────────────────────────────────────
+
+def check_exits(ot, d5):
+    """
+    Checks BE trigger, partial TP hits, and full close conditions.
+    Modifies ot in-place. Returns (events, fully_closed, close_reason,on, slose_px).
+    """
+    i    = len(d5["ts"]) - 1
+    h    = d5["h"][i]; l = d5["l"][i]; c = d5["c"][i]
+    ot["bars"] = ot.get("bars", 0) + 1
+    dirn = ot["dir"]
+    events = []
+
+    # ── Breakeven trigger ─────────────────────────────────────────────────
+    if not ot.get("be_hit", False):
+        if (dirn=="LONG"  and h >= ot["be"]) or \
+           (dirn=="SHORT" and l <= ot["be"]):
+            ot["sl"]     = ot["entry"]
+            ot["be_hit"] = True
+            events.append("BE_TRIGGERED")
+
+    sl = ot["sl"]
+
+    # ── Partial TP hits ───────────────────────────────────────────────────
+    if dirn == "LONG":
+        if not ot["tp1_hit"] and h >= ot["tp1"]:
+            pnl = (ot["tp1"] - ot["entry"]) * ot["size"] * Cfg.TP1_FRAC
+            ot["pnl"] += pnl; ot["rem"] -= Cfg.TP1_FRAC; ot["tp1_hit"] = True
+            events.append(f"TP1:+${pnl:.2f}")
+        if ot["tp1_hit"] and not ot["tp2_hit"] and h >= ot["tp2"]:
+            pnl = (ot["tp2"] - ot["entry"]) * ot["size"] * Cfg.TP2_FRAC
+            ot["pnl"] += pnl; ot["rem"] -= Cfg.TP2_FRAC; ot["tp2_hit"] = True
+            events.append(f"TP2:+${pnl:.2f}")
+        if ot["tp2_hit"] and not ot["tp3_hit"] and h >= ot["tp3"]:
+            pnl = (ot["tp3"] - ot["entry"]) * ot["size"] * ot["rem"]
+            ot["pnl"] += pnl; ot["rem"] = 0; ot["tp3_hit"] = True
+            events.append(f"TP3:+${pnl:.2f}")
+    else:  # SHORT
+        if not ot["tp1_hit"] and l <= ot["tp1"]:
+            pnl = (ot["entry"] - ot["tp1"]) * ot["size"] * Cfg.TP1_FRAC
+            ot["pnl"] += pnl; ot["rem"] -= Cfg.TP1_FRAC; ot["tp1_hit"] = True
+            events.append(f"TP1:+${pnl:.2f}")
+        if ot["tp1_hit"] and not ot["tp2_hit"] and l <= ot["tp2"]:
+            pnl = (ot["entry"] - ot["tp2"]) * ot["size"] * Cfg.TP2_FRAC
+            ot["pnl"] += pnl; ot["rem"] -= Cfg.TP2_FRAC; ot["tp2_hit"] = True
+            events.append(f"TP2:+${pnl:.2f}")
+        if ot["tp2_hit"] and not ot["tp3_hit"] and l <= ot["tp3"]:
+            pnl = (ot["entry"] - ot["tp3"]) * ot["size"] * ot["rem"]
+            ot["pnl"] += pnl; ot["rem"] = 0; ot["tp3_hit"] = True
+            events.append(f"TP3:+${pnl:.2f}")
+
+    # ── Full close conditions ─────────────────────────────────────────────
+    if ot["tp3_hit"] or ot["rem"] <= 0:
+        return events, True, "TP3", ot["tp3"]
+
+    sl_hit = (dirn=="LONG" and l<=sl) or (dirn=="SHORT" and h>=sl)
+    if sl_hit:
+        sl_pnl = ((sl - ot["entry"]) if dirn=="LONG" else (ot["entry"] - sl)) \
+                 * ot["size"] * ot["rem"]
+        ot["pnl"] += sl_pnl; ot["rem"] = 0
+        reason = "BE" if ot.get("be_hit") else "SL"
+        return events, True, reason, sl
+
+    if ot["bars"] >= Cfg.MAX_HOLD:
+        t_pnl = ((c - ot["entry"]) if dirn=="LONG" else (ot["entry"] - c)) \
+                * ot["size"] * ot["rem"]
+        ot["pnl"] += t_pnl; ot["rem"] = 0
+        return events, True, "TIME", c
+
+    return events, False, None, None
+
+
+# ─── Telegram ─────────────────────────────────────────────────────────────────
+
+def tg(text):
+    if not Cfg.TG_TOKEN or not Cfg.TG_CHAT_ID:
+        log.info(f"[TG] {text[:120]}")
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{Cfg.TG_TOKEN}/sendMessage",
+            json={"chat_id": Cfg.TG_CHAT_ID, "text": text, "parse_mode": "HTML"},
+            timeout=10)
+    except Exception as e:
+        log.warning(f"Telegram: {e}")
+
+def tg_opened(sym, ot):
+    tg(f"<b>{'📈' if ot['dir']=='LONG' else '📉'} {sym} {ot['dir']} OPENED</b>\n"
+       f"Entry : ${ot['entry']:,.4f}\n"
+       f"TP1   : ${ot['tp1']:,.4f}  (40% close)\n"
+       f"TP2   : ${ot['tp2']:,.4f}  (30% close)\n"
+       f"TP3   : ${ot['tp3']:,.4f}  (30% close)\n"
+       f"SL    : ${ot['sl']:,.4f}\n"
+       f"BE    : ${ot['be']:,.4f}  (SL→entry when hit)\n"
+       f"Signal: {ot['reason']}")
+
+def tg_tp_hit(sym, ot, event):
+    tg(f"<b>🎯 {sym} {event} HIT</b>\n"
+       f"Dir   : {ot['dir']}\n"
+       f"Rem   : {ot['rem']*100:.0f}% still open\n"
+       f"SL now: ${ot['sl']:,.4f}")
+
+def tg_closed(sym, ot, capital):
+    sign  = "+" if ot["pnl"] >= 0 else ""
+    emoji = "✅ WIN" if ot["pnl"]>0 else ("⚖️ BREAK" if ot["pnl"]==0 else "❌ LOSS")
+    tp_lvl = ('TP3' if ot['tp3_hit'] else 'TP2' if ot['tp2_hit'] else 'TP1' if ot['tp1_hit'] else 'NONE')
+    tg(f"<b>{emoji} — {sym} {ot['dir']} closed ({ot.get('close_reason','?')})</b>\n"
+       f"Entry    : ${ot['entry']:,.4f}\n"
+       f"TP level : {tp_lvl}\n"
+       f"P&L      : {sign}${ot['pnl']:,.2f}\n"
+       f"Capital  : ${capital:,.2f}")
+
+def tg_heartbeat(S):
+    ret = (S["capital"]-Cfg.IC)/Cfg.IC*100
+    mdd = (S["peak"]-S["capital"])/S["peak"]*100 if S["peak"]>0 else 0
+    lines = [
+        f"<b>💓 Heartbeat #{S['checks']}</b>",
+        f"Capital : ${S['capital']:,.2f} ({ret:+.2f}%)",
+        f"MaxDD   : {mdd:.1f}%",
+        f"Trades  : {len(S['trades'])} | Signals:{S['signals']} | Chops:{S['chops']}",
+        ""
+    ]
+    for sym in PAIRS:
+        ps = S["pair_stats"].get(sym, {})
+        ot = S["open_trades"].get(sym)
+        if ot:
+            pos = f"OPEN {ot['dir']} @ ${ot['entry']:,.2f} | rem:{ot['rem']*100:.0f}%"
+        else:
+            pos = "No position"
+        wr = f"{ps.get('wins',0)}/{ps.get('trades',0)}" if ps.get('trades') else "0/0"
+        lines.append(f"<b>{sym}</b>: {pos} | W/T:{wr} | P&L:${ps.get('pnl',0):+.0f}")
+    tg("\n".join(lines))
+
+
+# ─── Main loop ────────────────────────────────────────────────────────────────
+
+def main():
+    log.info("=== MTF BOT v3.0 — CHAMPION — BTC/ETH/SOL ===")
+    S = load_state()
+    log.info(f"State: checks={S['checks']} capital=${S['capital']:.2f} trades={len(S['trades'])}")
+    tg(f"<b>🚀 MTF Bot v3.0 CHAMPION started</b>\n"
+       f"Pairs    : {', '.join(PAIRS)}\n"
+       f"TP 40/30/30% @ 4.5R / 7.2R / 18R\n"
+       f"Session  : 07–20 UTC only\n"
+       f"RSI mom  : 2-bar confirmation\n"
+       f"1H RSI   : filter active\n"
+       f"Capital  : ${S['capital']:,.2f}\n"
+       f"Backtest : PF 18.13 | MaxDD 1.5% | WR 56%")
+
+    while True:
+        loop_start = time.time()
+        try:
+            S["checks"] += 1
+            log.info(f"=== Check #{S['checks']} ===")
+
+            for sym in PAIRS:
+                try:
+                    raw5m  = fetch_klines(sym, "5m",  600)
+                    raw15m = fetch_klines(sym, "15m", 500)
+                    raw1h  = fetch_klines(sym, "1h",  200)
+                    d5 = build(raw5m, raw15m, raw1h)
+                    px = d5["c"][-1]
+
+                    if sym not in S["start_px"]:
+                        S["start_px"][sym] = px
+
+                    ps = S["pair_stats"].setdefault(sym, {"trades":0,"wins":0,"pnl":0.0})
+
+                    # ── Exit check ─────────────────────────────────────────
+                    ot = S["open_trades"].get(sym)
+                    if ot:
+                        events, closed, c_reason, c_px = check_exits(ot, d5)
+
+                        for ev in events:
+                            if ev.startswith("TP"):
+                                tg_tp_hit(sym, ot, ev.split(":")[0])
+                            elif ev == "BE_TRIGGERED":
+                                tg(f"<b>🔒 {sym} — Breakeven triggered!</b>\n"
+                                   f"SL moved to entry: ${ot['entry']:,.4f}")
+
+                        if closed:
+                            ot["close_reason"] = c_reason
+                            S["capital"] += ot["pnl"]
+                            S["peak"]     = max(S["peak"], S["capital"])
+                            S["trades"].append({**ot, "symbol":sym,
+                                "close_time": datetime.now(timezone.utc).isoformat()})
+                            ps["trades"] += 1
+                            ps["pnl"]    += ot["pnl"]
+                            if ot["pnl"] > 0: ps["wins"] += 1
+                            S["open_trades"].pop(sym)
+                            log.info(f"{sym} CLOSED {c_reason} {ot['dir']} P&L ${ot['pnl']:+.2f} | cap=${S['capital']:.2f}")
+                            tg_closed(sym, ot, S["capital"])
+                        else:
+                            ep = ((px - ot["entry"]) if ot["dir"]=="LONG"
+                                  else (ot["entry"] - px)) * ot["size"] * ot["rem"]
+                            log.info(f"{sym} HOLDING {ot['dir']} {ot['bars']}bars rem:{ot['rem']*100:.0f}% est:${ep:+.2f}")
+
+                    # ── Entry check ────────────────────────────────────────
+                    if sym not in S["open_trades"]:
+                        result = get_signal(d5, S["capital"])
+                        sig    = result["sig"]
+                        m      = result.get("m", {})
+                        log.info(f"{sym} ${px:,.2f} | 15M:{m.get('tr','?')} | "
+                                 f"RSI:{m.get('rsi',0):.1f} | ATR:{m.get('ar',0):.2f}x | "
+                                 f"Dist:{m.get('dist',0)*100:.3f}% | Hr:{m.get('hour','?')} | {sig}")
+                        if sig == "CHOP":
+                            S["chops"] += 1
+                        elif sig in ("LONG","SHORT"):
+                            new_ot = {
+                                "symbol":    sym,
+                                "dir":       sig,
+                                "entry":     result["m"]["px"],
+                                "sl":        result["sl"],
+                                "tp1":       result["tp1"],
+                                "tp2":       result["tp2"],
+                                "tp3":       result["tp3"],
+                                "be":        result["be"],
+                                "size":      result["sz"],
+                                "be_hit":    False,
+                                "tp1_hit":   False,
+                                "tp2_hit":   False,
+                                "tp3_hit":   False,
+                                "rem":       1.0,
+                                "pnl":       0.0,
+                                "bars":      0,
+                                "reason":    result["reason"],
+                                "open_time": datetime.now(timezone.utc).isoformat()
+                            }
+                            S["open_trades"][sym] = new_ot
+                            S["signals"] += 1
+                            log.info(f"{sym} {sig} entry={new_ot['entry']:.2f} "
+                                     f"TP1={new_ot['tp1']:.2f} TP2={new_ot['tp2']:.2f} "
+                                     f"TP3={new_ot['tp3']:.2f} SL={new_ot['sl']:.2f}")
+                            tg_opened(sym, new_ot)
+                    else:
+                        log.info(f"{sym} ${px:,.2f} | in trade")
+
+                except Exception as e:
+                    log.error(f"{sym} error: {e}")
+
+            save_state(S)
+            if S["checks"] % 12 == 0:
+                tg_heartbeat(S)
+
+        except Exception as e:
+            log.exception(f"Main loop error: {e}")
+            tg(f"⚠️ Bot error: {e}\nRetrying in 5 min...")
+
+        elapsed = time.time() - loop_start
+        time.sleep(max(5, Cfg.INTERVAL - elapsed))
+
+
+if __name__ == "__main__":
+    main()
