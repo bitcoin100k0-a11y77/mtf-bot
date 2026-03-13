@@ -1,20 +1,20 @@
 """
-MTF Scalping Bot — CHAMPION v3.0
+MTF Scalping Bot â CHAMPION v3.0
 =================================
 Strategy  : 15M EMA9 trend + 5M EMA21 pullback + RSI + ATR chop filter
 Pairs     : BTCUSDT, ETHUSDT, SOLUSDT
 
 NEW in v3 (vs v2):
-  ✦ Session filter       — only trade 07:00–20:00 UTC (London + NY)
-  ✦ RSI momentum filter  — require RSI rising 2 bars (long) / falling 2 bars (short)
-  ✦ 1H RSI filter        — 1H RSI > 40 for longs, < 60 for shorts
-  ✦ Optimised SL/TP      — SL=1.8× ATR, TP1=4.5×, TP2=7.2×, TP3=18×
-  ✦ Looser pull zone     — 1.0% vs 0.7%
-  ✦ Adjusted RSI bands   — enter long <45, short >60
-  ✦ Breakeven SL         — unchanged (1:1 trigger)
-  ✦ 3-tier partial TP    — 40% @ TP1, 30% @ TP2, 30% @ TP3
+  â¦ Session filter       â only trade 07:00â20:00 UTC (London + NY)
+  â¦ RSI momentum filter  â require RSI rising 2 bars (long) / falling 2 bars (short)
+  â¦ 1H RSI filter        â 1H RSI > 40 for longs, < 60 for shorts
+  â¦ Optimised SL/TP      â SL=1.8Ã ATR, TP1=4.5Ã, TP2=7.2Ã, TP3=18Ã
+  â¦ Looser pull zone     â 1.0% vs 0.7%
+  â¦ Adjusted RSI bands   â enter long <45, short >60
+  â¦ Breakeven SL         â unchanged (1:1 trigger)
+  â¦ 3-tier partial TP    â 40% @ TP1, 30% @ TP2, 30% @ TP3
 
-Backtest (BTC, Jan–Mar 2026):
+Backtest (BTC, JanâMar 2026):
   Baseline (v2): 91 trades | WR 49.5% | PF  6.41 | MaxDD 3.0%
   Champion (v3): 50 trades | WR 56.0% | PF 18.13 | MaxDD 1.5%
   (3-pair live expected ~150 trades/period)
@@ -37,34 +37,34 @@ class Cfg:
     TG_TOKEN    = os.getenv("TELEGRAM_TOKEN", "")
     TG_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
 
-    # ── Core strategy ──────────────────────────────────────────────────────
+    # ââ Core strategy ââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     TF_EMA      = 9          # 15M EMA period
     M5_EMA      = 21         # 5M EMA period
     RSI_P       = 14
     ATR_P       = 14
 
-    # ── Entry filters ──────────────────────────────────────────────────────
+    # ââ Entry filters ââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     PULL_PCT    = 0.010       # v3: 1.0% pull-back zone (was 0.7%)
     RSI_LO      = 45          # v3: long when RSI < 45 (was 40)
     RSI_HI      = 60          # v3: short when RSI > 60 (unchanged)
     RSI_FLOOR   = 25.0
     RSI_CEIL    = 75.0
-    ATR_REL     = 0.90        # ATR must be ≥ 90% of avg (chop filter)
+    ATR_REL     = 0.90        # ATR must be â¥ 90% of avg (chop filter)
     ATR_AVG_N   = 100
 
-    # ── Session filter (v3 NEW) ────────────────────────────────────────────
+    # ââ Session filter (v3 NEW) ââââââââââââââââââââââââââââââââââââââââââââ
     SESSION_START = 7         # 07:00 UTC = London open
     SESSION_END   = 20        # 20:00 UTC = NY close
 
-    # ── 1H RSI filter (v3 NEW) ────────────────────────────────────────────
+    # ââ 1H RSI filter (v3 NEW) ââââââââââââââââââââââââââââââââââââââââââââ
     RSI_1H_LO   = 40.0        # 1H RSI must be > 40 to go LONG
     RSI_1H_HI   = 60.0        # 1H RSI must be < 60 to go SHORT
 
-    # ── Risk & sizing ──────────────────────────────────────────────────────
-    SL_MULT     = 1.8         # v3: 1.8× ATR (was 1.5)
-    TP1_MULT    = 4.5         # v3: 4.5× ATR (was 3.5)
-    TP2_MULT    = 7.2         # v3: 7.2× ATR (= 1.6 × TP1)
-    TP3_MULT    = 18.0        # v3: 18×  ATR (= 4.0 × TP1)
+    # ââ Risk & sizing ââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+    SL_MULT     = 1.8         # v3: 1.8Ã ATR (was 1.5)
+    TP1_MULT    = 4.5         # v3: 4.5Ã ATR (was 3.5)
+    TP2_MULT    = 7.2         # v3: 7.2Ã ATR (= 1.6 Ã TP1)
+    TP3_MULT    = 18.0        # v3: 18Ã  ATR (= 4.0 Ã TP1)
     TP1_FRAC    = 0.40        # v3: close 40% at TP1 (was 50%)
     TP2_FRAC    = 0.30        # close 30% at TP2
     # remaining 30% closes at TP3
@@ -77,7 +77,7 @@ class Cfg:
     STATE_FILE  = Path(os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "/data")) / "bot_state.json"
 
 
-# ─── Indicators ───────────────────────────────────────────────────────────────
+# âââ Indicators âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 def calc_ema(values, period):
     k = 2 / (period + 1)
@@ -106,8 +106,8 @@ def calc_rsi(closes, period=14):
     return out
 
 def calc_atr(highs, lows, closes, period=14):
-    tr = [None]*len highs)
-    for i in range(1, len highs)):
+    tr = [None]*len(highs)
+    for i in range(1, len(highs)):
         tr[i] = max(highs[i]-lows[i],
                     abs(highs[i]-closes[i-1]),
                     abs(lows[i] -closes[i-1]))
@@ -129,7 +129,7 @@ def rolling_mean(values, window):
     return out
 
 
-# ─── State ────────────────────────────────────────────────────────────────────
+# âââ State ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 def fresh_state():
     return {
@@ -161,7 +161,7 @@ def save_state(S):
         log.warning(f"Could not save state: {e}")
 
 
-# ─── Data & build ─────────────────────────────────────────────────────────────
+# âââ Data & build âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 def fetch_klines(symbol, interval, limit):
     url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
@@ -252,7 +252,7 @@ def build(raw5m, raw15m, raw1h):
     return d5
 
 
-# ─── Signal ───────────────────────────────────────────────────────────────────
+# âââ Signal âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 def get_signal(d5, capital):
     n = len(d5["ts"])
@@ -276,33 +276,33 @@ def get_signal(d5, capital):
     m = {"px":c,"e21":d5["e21"][i],"rsi":rc,"atr":atr_val,
          "ar":ar,"hour":hour,"rsi_1h":rsi_1h}
 
-    # ── Chop filter ──────────────────────────────────────────────────────
+    # ââ Chop filter ââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     if ar is None or ar < Cfg.ATR_REL:
         return {"sig": "CHOP", "reason": f"ATR {ar:.2f}x" if ar else "ATR N/A", "m": m}
 
-    # ── Session filter (v3) ───────────────────────────────────────────────
+    # ââ Session filter (v3) âââââââââââââââââââââââââââââââââââââââââââââââ
     if not (Cfg.SESSION_START <= hour < Cfg.SESSION_END):
         return {"sig": "WATCH", "reason": f"off-session {hour}:xx UTC", "m": m}
 
-    # ── Candle quality ────────────────────────────────────────────────────
+    # ââ Candle quality ââââââââââââââââââââââââââââââââââââââââââââââââââââ
     rng  = h - l
     body = abs(c-o)/rng if rng > 0 else 0
     bull = c > o and body > 0.45
     bear = c < o and body > 0.45
 
-    # ── Distance filter ──────────────────────────────────────────────────
+    # ââ Distance filter ââââââââââââââââââââââââââââââââââââââââââââââââââ
     near = dist < Cfg.PULL_PCT
 
     tr_d = "UP" if d5["tf_up"][i] else ("DOWN" if d5["tf_dn"][i] else "FLAT")
 
-    # ── LONG signal ───────────────────────────────────────────────────────
+    # ââ LONG signal âââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     if (d5["tf_up"][i]
             and near
             and rp < Cfg.RSI_LO and rc > rp       # RSI turning up from below 45
             and rc > Cfg.RSI_FLOOR
             and bull
-            and rsi_rise                             # ← v3: RSI rising 2 bars
-            and (rsi_1h is None or rsi_1h > Cfg.RSI_1H_LO)):  # ← v3: 1H filter
+            and rsi_rise                             # â v3: RSI rising 2 bars
+            and (rsi_1h is None or rsi_1h > Cfg.RSI_1H_LO)):  # â v3: 1H filter
         sl  = c - atr_val * Cfg.SL_MULT
         tp1 = c + atr_val * Cfg.TP1_MULT
         tp2 = c + atr_val * Cfg.TP2_MULT
@@ -310,18 +310,18 @@ def get_signal(d5, capital):
         be  = c + atr_val * Cfg.SL_MULT
         sz  = (capital * Cfg.RISK_PCT) / (atr_val * Cfg.SL_MULT)
         return {"sig": "LONG",
-                "reason": f"15M-UP EMA+RSI {rp:.0f}→{rc:.0f}",
+                "reason": f"15M-UP EMA+RSI {rp:.0f}â{rc:.0f}",
                 "m": m, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
                 "be": be, "sz": sz}
 
-    # ── SHORT signal ──────────────────────────────────────────────────────
+    # ââ SHORT signal ââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     if (d5["tf_dn"][i]
             and near
             and rp > Cfg.RSI_HI and rc < rp        # RSI turning down from above 60
             and rc < Cfg.RSI_CEIL
             and bear
-            and rsi_fall                             # ← v3: RSI falling 2 bars
-            and (rsi_1h is None or rsi_1h < Cfg.RSI_1H_HI)):  # ← v3: 1H filter
+            and rsi_fall                             # â v3: RSI falling 2 bars
+            and (rsi_1h is None or rsi_1h < Cfg.RSI_1H_HI)):  # â v3: 1H filter
         sl  = c + atr_val * Cfg.SL_MULT
         tp1 = c - atr_val * Cfg.TP1_MULT
         tp2 = c - atr_val * Cfg.TP2_MULT
@@ -329,7 +329,7 @@ def get_signal(d5, capital):
         be  = c - atr_val * Cfg.SL_MULT
         sz  = (capital * Cfg.RISK_PCT) / (atr_val * Cfg.SL_MULT)
         return {"sig": "SHORT",
-                "reason": f"15M-DOWN EMA+RSI {rp:.0f}→{rc:.0f}",
+                "reason": f"15M-DOWN EMA+RSI {rp:.0f}â{rc:.0f}",
                 "m": m, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
                 "be": be, "sz": sz}
 
@@ -341,7 +341,7 @@ def get_signal(d5, capital):
     return {"sig": "WATCH", "reason": reason, "m": m}
 
 
-# ─── Exit check (partial TPs + breakeven) ─────────────────────────────────────
+# âââ Exit check (partial TPs + breakeven) âââââââââââââââââââââââââââââââââââââ
 
 def check_exits(ot, d5):
     """
@@ -354,7 +354,7 @@ def check_exits(ot, d5):
     dirn = ot["dir"]
     events = []
 
-    # ── Breakeven trigger ─────────────────────────────────────────────────
+    # ââ Breakeven trigger âââââââââââââââââââââââââââââââââââââââââââââââââ
     if not ot.get("be_hit", False):
         if (dirn=="LONG"  and h >= ot["be"]) or \
            (dirn=="SHORT" and l <= ot["be"]):
@@ -364,7 +364,7 @@ def check_exits(ot, d5):
 
     sl = ot["sl"]
 
-    # ── Partial TP hits ───────────────────────────────────────────────────
+    # ââ Partial TP hits âââââââââââââââââââââââââââââââââââââââââââââââââââ
     if dirn == "LONG":
         if not ot["tp1_hit"] and h >= ot["tp1"]:
             pnl = (ot["tp1"] - ot["entry"]) * ot["size"] * Cfg.TP1_FRAC
@@ -392,7 +392,7 @@ def check_exits(ot, d5):
             ot["pnl"] += pnl; ot["rem"] = 0; ot["tp3_hit"] = True
             events.append(f"TP3:+${pnl:.2f}")
 
-    # ── Full close conditions ─────────────────────────────────────────────
+    # ââ Full close conditions âââââââââââââââââââââââââââââââââââââââââââââ
     if ot["tp3_hit"] or ot["rem"] <= 0:
         return events, True, "TP3", ot["tp3"]
 
@@ -413,7 +413,7 @@ def check_exits(ot, d5):
     return events, False, None, None
 
 
-# ─── Telegram ─────────────────────────────────────────────────────────────────
+# âââ Telegram âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 def tg(text):
     if not Cfg.TG_TOKEN or not Cfg.TG_CHAT_ID:
@@ -428,26 +428,26 @@ def tg(text):
         log.warning(f"Telegram: {e}")
 
 def tg_opened(sym, ot):
-    tg(f"<b>{'📈' if ot['dir']=='LONG' else '📉'} {sym} {ot['dir']} OPENED</b>\n"
+    tg(f"<b>{'ð' if ot['dir']=='LONG' else 'ð'} {sym} {ot['dir']} OPENED</b>\n"
        f"Entry : ${ot['entry']:,.4f}\n"
        f"TP1   : ${ot['tp1']:,.4f}  (40% close)\n"
        f"TP2   : ${ot['tp2']:,.4f}  (30% close)\n"
        f"TP3   : ${ot['tp3']:,.4f}  (30% close)\n"
        f"SL    : ${ot['sl']:,.4f}\n"
-       f"BE    : ${ot['be']:,.4f}  (SL→entry when hit)\n"
+       f"BE    : ${ot['be']:,.4f}  (SLâentry when hit)\n"
        f"Signal: {ot['reason']}")
 
 def tg_tp_hit(sym, ot, event):
-    tg(f"<b>🎯 {sym} {event} HIT</b>\n"
+    tg(f"<b>ð¯ {sym} {event} HIT</b>\n"
        f"Dir   : {ot['dir']}\n"
        f"Rem   : {ot['rem']*100:.0f}% still open\n"
        f"SL now: ${ot['sl']:,.4f}")
 
 def tg_closed(sym, ot, capital):
     sign  = "+" if ot["pnl"] >= 0 else ""
-    emoji = "✅ WIN" if ot["pnl"]>0 else ("⚖️ BREAK" if ot["pnl"]==0 else "❌ LOSS")
+    emoji = "â WIN" if ot["pnl"]>0 else ("âï¸ BREAK" if ot["pnl"]==0 else "â LOSS")
     tp_lvl = ('TP3' if ot['tp3_hit'] else 'TP2' if ot['tp2_hit'] else 'TP1' if ot['tp1_hit'] else 'NONE')
-    tg(f"<b>{emoji} — {sym} {ot['dir']} closed ({ot.get('close_reason','?')})</b>\n"
+    tg(f"<b>{emoji} â {sym} {ot['dir']} closed ({ot.get('close_reason','?')})</b>\n"
        f"Entry    : ${ot['entry']:,.4f}\n"
        f"TP level : {tp_lvl}\n"
        f"P&L      : {sign}${ot['pnl']:,.2f}\n"
@@ -457,7 +457,7 @@ def tg_heartbeat(S):
     ret = (S["capital"]-Cfg.IC)/Cfg.IC*100
     mdd = (S["peak"]-S["capital"])/S["peak"]*100 if S["peak"]>0 else 0
     lines = [
-        f"<b>💓 Heartbeat #{S['checks']}</b>",
+        f"<b>ð Heartbeat #{S['checks']}</b>",
         f"Capital : ${S['capital']:,.2f} ({ret:+.2f}%)",
         f"MaxDD   : {mdd:.1f}%",
         f"Trades  : {len(S['trades'])} | Signals:{S['signals']} | Chops:{S['chops']}",
@@ -475,16 +475,16 @@ def tg_heartbeat(S):
     tg("\n".join(lines))
 
 
-# ─── Main loop ────────────────────────────────────────────────────────────────
+# âââ Main loop ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 def main():
-    log.info("=== MTF BOT v3.0 — CHAMPION — BTC/ETH/SOL ===")
+    log.info("=== MTF BOT v3.0 â CHAMPION â BTC/ETH/SOL ===")
     S = load_state()
     log.info(f"State: checks={S['checks']} capital=${S['capital']:.2f} trades={len(S['trades'])}")
-    tg(f"<b>🚀 MTF Bot v3.0 CHAMPION started</b>\n"
+    tg(f"<b>ð MTF Bot v3.0 CHAMPION started</b>\n"
        f"Pairs    : {', '.join(PAIRS)}\n"
        f"TP 40/30/30% @ 4.5R / 7.2R / 18R\n"
-       f"Session  : 07–20 UTC only\n"
+       f"Session  : 07â20 UTC only\n"
        f"RSI mom  : 2-bar confirmation\n"
        f"1H RSI   : filter active\n"
        f"Capital  : ${S['capital']:,.2f}\n"
@@ -509,7 +509,7 @@ def main():
 
                     ps = S["pair_stats"].setdefault(sym, {"trades":0,"wins":0,"pnl":0.0})
 
-                    # ── Exit check ─────────────────────────────────────────
+                    # ââ Exit check âââââââââââââââââââââââââââââââââââââââââ
                     ot = S["open_trades"].get(sym)
                     if ot:
                         events, closed, c_reason, c_px = check_exits(ot, d5)
@@ -518,7 +518,7 @@ def main():
                             if ev.startswith("TP"):
                                 tg_tp_hit(sym, ot, ev.split(":")[0])
                             elif ev == "BE_TRIGGERED":
-                                tg(f"<b>🔒 {sym} — Breakeven triggered!</b>\n"
+                                tg(f"<b>ð {sym} â Breakeven triggered!</b>\n"
                                    f"SL moved to entry: ${ot['entry']:,.4f}")
 
                         if closed:
@@ -538,7 +538,7 @@ def main():
                                   else (ot["entry"] - px)) * ot["size"] * ot["rem"]
                             log.info(f"{sym} HOLDING {ot['dir']} {ot['bars']}bars rem:{ot['rem']*100:.0f}% est:${ep:+.2f}")
 
-                    # ── Entry check ────────────────────────────────────────
+                    # ââ Entry check ââââââââââââââââââââââââââââââââââââââââ
                     if sym not in S["open_trades"]:
                         result = get_signal(d5, S["capital"])
                         sig    = result["sig"]
@@ -587,7 +587,7 @@ def main():
 
         except Exception as e:
             log.exception(f"Main loop error: {e}")
-            tg(f"⚠️ Bot error: {e}\nRetrying in 5 min...")
+            tg(f"â ï¸ Bot error: {e}\nRetrying in 5 min...")
 
         elapsed = time.time() - loop_start
         time.sleep(max(5, Cfg.INTERVAL - elapsed))
