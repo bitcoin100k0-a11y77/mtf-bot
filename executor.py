@@ -26,7 +26,7 @@ TRADING_MODE = os.getenv("TRADING_MODE", "live").lower()  # "live" or "paper"
 # Log public IP on startup so we can whitelist it on Binance
 try:
     import urllib.request as _urlreq
-    _pub_ip = _urlreq.urlopen("https://api.ipify.org", timeout=5).read().decode()
+    _pub_ip = _urlreq.urlopen("https://api4.ipify.org", timeout=5).read().decode()  # api4 = IPv4 only
     log.info(f"\U0001f310 Railway public IP: {_pub_ip}  \u2190 add this to Binance API whitelist")
 except Exception as _e:
     log.warning(f"Could not fetch public IP: {_e}")
