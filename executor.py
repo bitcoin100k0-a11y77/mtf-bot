@@ -23,13 +23,24 @@ log = logging.getLogger("Executor")
 
 TRADING_MODE = os.getenv("TRADING_MODE", "live").lower()  # "live" or "paper"
 
-# Log public IP on startup so we can whitelist it on Binance
+# Get public IPv4 on startup and send to Telegram so it can be whitelisted on Binance
 try:
     import urllib.request as _urlreq
-    _pub_ip = _urlreq.urlopen("https://api4.ipify.org", timeout=5).read().decode()  # api4 = IPv4 only
-    log.info(f"\U0001f310 Railway public IP: {_pub_ip}  \u2190 add this to Binance API whitelist")
+    import json as _json
+    _pub_ip = _urlreq.urlopen("https://api4.ipify.org", timeout=5).read().decode().strip()
+    log.info(f"Railway public IPv4: {_pub_ip}")
+    # Send IP to Telegram so it's visible even if Railway redacts logs
+    _tg_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    _tg_chat  = os.getenv("TELEGRAM_CHAT_ID", "")
+    if _tg_token and _tg_chat:
+        _msg = f"\U0001f310 Railway public IPv4: {_pub_ip}\n\nAdd this to Binance API key whitelist to enable Futures."
+        _tg_url = f"https://api.telegram.org/bot{_tg_token}/sendMessage"
+        _tg_data = _json.dumps({"chat_id": _tg_chat, "text": _msg}).encode()
+        _req = _urlreq.Request(_tg_url, data=_tg_data, headers={"Content-Type": "application/json"})
+        _urlreq.urlopen(_req, timeout=5)
+        log.info("Public IP sent to Telegram.")
 except Exception as _e:
-    log.warning(f"Could not fetch public IP: {_e}")
+    log.warning(f"Could not fetch/send public IP: {_e}")
 DAILY_LOSS_LIMIT_PCT = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "5.0"))  # 🔴 RISK: halt after 5% daily DD
 MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))   # 🔴 RISK: halt after 3 losses in a row
 LEVERAGE = int(os.getenv("FUTURES_LEVERAGE", "1"))  # 🔴 RISK: default 1x, no leverage
