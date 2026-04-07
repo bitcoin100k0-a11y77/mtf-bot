@@ -1,1 +1,5 @@
-requests==2.31.0
+# Champion v4.1 — Live Execution Dependencies
+# ⚠️ Pin versions to avoid breaking changes in production
+
+ccxt==4.4.35           # Exchange API (Binance Futures)
+requests==2.32.3       # HTTP client (Telegram, Binance public API)
