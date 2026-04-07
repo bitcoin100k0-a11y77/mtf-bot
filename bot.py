@@ -1,20 +1,25 @@
 """
-MTF Scalping Bot — CHAMPION v4.0
-=================================
+MTF Scalping Bot — CHAMPION v4.0 + LIVE EXECUTION
+===================================================
 Strategy  : 15M EMA9 trend + 5M EMA21 pullback + RSI + ATR chop filter
 Pairs     : BTCUSDT, ETHUSDT, SOLUSDT
+Execution : Binance USD-M Futures via CCXT (executor.py)
 
-NEW in v3 (vs v2):
-  Ã¢ÂÂ¦ Session filter       Ã¢ÂÂ only trade 07:00Ã¢ÂÂ20:00 UTC (London + NY)
-  Ã¢ÂÂ¦ RSI momentum filter  Ã¢ÂÂ require RSI rising 2 bars (long) / falling 2 bars (short)
-  Ã¢ÂÂ¦ 1H RSI filter        Ã¢ÂÂ 1H RSI > 40 for longs, < 60 for shorts
-  Ã¢ÂÂ¦ Optimised SL/TP      Ã¢ÂÂ SL=1.8ÃÂ ATR, TP1=4.5ÃÂ, TP2=7.2ÃÂ, TP3=18ÃÂ
-  Ã¢ÂÂ¦ Looser pull zone     Ã¢ÂÂ 1.0% vs 0.7%
-  Ã¢ÂÂ¦ Adjusted RSI bands   Ã¢ÂÂ enter long <45, short >60
-  Ã¢ÂÂ¦ Breakeven SL         Ã¢ÂÂ unchanged (1:1 trigger)
-  Ã¢ÂÂ¦ 3-tier partial TP    Ã¢ÂÂ 40% @ TP1, 30% @ TP2, 30% @ TP3
+NEW in v4.1 (vs v4.0):
+  • Real order execution via executor.py
+  • Server-side stop-loss orders (survive bot crashes)
+  • Partial TP exits as real market orders
+  • Breakeven SL moves on exchange
+  • Circuit breaker: 3 consecutive losses OR 5% daily DD → halt
+  • TRADING_MODE env var: "live" or "paper"
+  • Position sizing from actual Futures wallet balance
 
-Backtest (BTC, JanÃ¢ÂÂMar 2026):
+⚠️ ENV REQUIRED: BINANCE_API_KEY, BINANCE_API_SECRET
+⚠️ ENV REQUIRED: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+⚠️ ENV OPTIONAL: TRADING_MODE (default: live), FUTURES_LEVERAGE (default: 1)
+🔴 RISK: When TRADING_MODE=live, this bot places REAL orders with REAL money
+
+Backtest (BTC, Jan–Mar 2026):
   Baseline (v2): 91 trades | WR 49.5% | PF  6.41 | MaxDD 3.0%
   Champion (v3): 50 trades | WR 56.0% | PF 18.13 | MaxDD 1.5%
   (3-pair live expected ~150 trades/period)
@@ -23,6 +28,9 @@ Backtest (BTC, JanÃ¢ÂÂMar 2026):
 import os, time, json, logging, requests
 from datetime import datetime, timezone
 from pathlib import Path
+
+# ── Execution layer import ──
+import executor
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,13 +45,13 @@ class Cfg:
     TG_TOKEN    = os.getenv("TELEGRAM_TOKEN", "")
     TG_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
 
-    # Ã¢ÂÂÃ¢ÂÂ Core strategy Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
+    # ── Core strategy ──────────────────────────────────────────────
     TF_EMA      = 9          # 15M EMA period
     M5_EMA      = 21         # 5M EMA period
     RSI_P       = 14
     ATR_P       = 14
 
-    # Ã¢ÂÂÃ¢ÂÂ Entry filters Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
+    # ── Entry filters ─────────────────────────────────────────────
     PULL_PCT    = 0.008       # v4: 0.8% pull-back zone (was 1.0%)
     RSI_LO      = 45          # v3: long when RSI < 45 (was 40)
     RSI_HI      = 60          # v3: short when RSI > 60 (unchanged)
@@ -52,34 +60,35 @@ class Cfg:
     ATR_REL     = 0.70        # v4: 0.70x avg (was 0.90x) - more valid setups
     ATR_AVG_N   = 100
 
-    # Ã¢ÂÂÃ¢ÂÂ Session filter (v3 NEW) Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
+    # ── Session filter (v3 NEW) ───────────────────────────────────
     SESSION_START = 7         # 07:00 UTC = London open
     SESSION_END   = 20        # 20:00 UTC = NY close
 
-    # Ã¢ÂÂÃ¢ÂÂ 1H RSI filter (v3 NEW) Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
+    # ── 1H RSI filter (v3 NEW) ────────────────────────────────────
     RSI_1H_LO   = 40.0        # 1H RSI must be > 40 to go LONG
     RSI_1H_HI   = 60.0        # 1H RSI must be < 60 to go SHORT
 
-    # Ã¢ÂÂÃ¢ÂÂ Risk & sizing Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
-    SL_MULT     = 1.8         # v3: 1.8ÃÂ ATR (was 1.5)
-    TP1_MULT    = 4.5         # v3: 4.5ÃÂ ATR (was 3.5)
-    TP2_MULT    = 7.2         # v3: 7.2ÃÂ ATR (= 1.6 ÃÂ TP1)
+    # ── Risk & sizing ─────────────────────────────────────────────
+    SL_MULT     = 1.8         # v3: 1.8× ATR (was 1.5)
+    TP1_MULT    = 4.5         # v3: 4.5× ATR (was 3.5)
+    TP2_MULT    = 7.2         # v3: 7.2× ATR (= 1.6 × TP1)
     TP3_MULT    = 30.0        # v4: 30x ATR - catch bigger runners (was 18x)
     TP1_FRAC    = 0.40        # v3: close 40% at TP1 (was 50%)
     TP2_FRAC    = 0.30        # close 30% at TP2
     # remaining 30% closes at TP3
 
     MAX_HOLD    = 48          # max bars before forced exit (5-min bars = 4 hours)
-    IC          = 10_000.0
-    RISK_PCT    = 0.0075      # 0.75% risk per trade
+    IC          = 10_000.0    # initial capital (virtual tracking)
+    RISK_PCT    = 0.0075      # 🔴 RISK: 0.75% risk per trade
 
     INTERVAL    = 300         # check every 5 minutes
     STATE_FILE  = Path(os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "/data")) / "bot_state.json"
 
 
-# Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂ Indicators Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
+# ─── Indicators ───────────────────────────────────────────────────────────────
 
 def calc_ema(values, period):
+    """Calculate Exponential Moving Average."""
     k = 2 / (period + 1)
     out, v = [None]*len(values), None
     for i, x in enumerate(values):
@@ -89,6 +98,7 @@ def calc_ema(values, period):
     return out
 
 def calc_rsi(closes, period=14):
+    """Calculate Relative Strength Index."""
     out = [None]*len(closes)
     if len(closes) < period + 2: return out
     g = l = 0.0
@@ -106,6 +116,7 @@ def calc_rsi(closes, period=14):
     return out
 
 def calc_atr(highs, lows, closes, period=14):
+    """Calculate Average True Range."""
     tr = [None]*len(highs)
     for i in range(1, len(highs)):
         tr[i] = max(highs[i]-lows[i],
@@ -122,6 +133,7 @@ def calc_atr(highs, lows, closes, period=14):
     return out
 
 def rolling_mean(values, window):
+    """Calculate rolling mean over a window."""
     out = [None]*len(values)
     for i in range(window-1, len(values)):
         chunk = [v for v in values[i-window+1:i+1] if v is not None]
@@ -129,9 +141,10 @@ def rolling_mean(values, window):
     return out
 
 
-# Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂ State Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
+# ─── State ────────────────────────────────────────────────────────────────────
 
 def fresh_state():
+    """Create a fresh bot state dictionary."""
     return {
         "capital": Cfg.IC, "peak": Cfg.IC,
         "checks": 0, "signals": 0, "chops": 0,
@@ -139,37 +152,45 @@ def fresh_state():
         "started_at": datetime.now(timezone.utc).isoformat(),
         "open_trades": {},
         "trades": [],
-        "pair_stats": {p: {"trades":0,"wins":0,"pnl":0.0} for p in PAIRS}
+        "pair_stats": {p: {"trades":0,"wins":0,"pnl":0.0} for p in PAIRS},
+        "circuit_breaker": {},  # v4.1: circuit breaker state
     }
 
 def load_state():
+    """Load bot state from disk, with safe defaults for missing keys."""
     try:
         if Cfg.STATE_FILE.exists():
             s = json.loads(Cfg.STATE_FILE.read_text())
             if "open_trades" not in s: s["open_trades"] = {}
             if "pair_stats"  not in s: s["pair_stats"]  = {p: {"trades":0,"wins":0,"pnl":0.0} for p in PAIRS}
+            if "circuit_breaker" not in s: s["circuit_breaker"] = {}
             return s
     except Exception as e:
         log.warning(f"Could not load state: {e}")
     return fresh_state()
 
 def save_state(S):
+    """Persist bot state to disk."""
     try:
+        # Save circuit breaker state
+        S["circuit_breaker"] = executor.circuit_breaker.to_dict()
         Cfg.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         Cfg.STATE_FILE.write_text(json.dumps(S, indent=2))
     except Exception as e:
         log.warning(f"Could not save state: {e}")
 
 
-# Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂ Data & build Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
+# ─── Data & build ────────────────────────────────────────────────────────────
 
 def fetch_klines(symbol, interval, limit):
+    """Fetch kline data from Binance public API."""
     url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
     r = requests.get(url, timeout=15)
     r.raise_for_status()
     return r.json()
 
 def build(raw5m, raw15m, raw1h):
+    """Build indicator dataset from raw kline data across 3 timeframes."""
     def parse(raw):
         o,h,l,c,v,ts = [],[],[],[],[],[]
         for k in raw:
@@ -252,9 +273,13 @@ def build(raw5m, raw15m, raw1h):
     return d5
 
 
-# Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂ Signal Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
+# ─── Signal ───────────────────────────────────────────────────────────────────
 
 def get_signal(d5, capital):
+    """Generate entry signal from 5M indicator dataset.
+
+    Returns dict with sig: LONG/SHORT/WATCH/CHOP and all trade parameters.
+    """
     n = len(d5["ts"])
     i, p = n-2, n-3
     if i < 120 or d5["atr"][i] is None or d5["rsi"][i] is None:
@@ -276,33 +301,33 @@ def get_signal(d5, capital):
     m = {"px":c,"e21":d5["e21"][i],"rsi":rc,"atr":atr_val,
          "ar":ar,"hour":hour,"rsi_1h":rsi_1h}
 
-    # Ã¢ÂÂÃ¢ÂÂ Chop filter Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
+    # ── Chop filter ──────────────────────────────────────────────
     if ar is None or ar < Cfg.ATR_REL:
         return {"sig": "CHOP", "reason": f"ATR {ar:.2f}x" if ar else "ATR N/A", "m": m}
 
-    # Ã¢ÂÂÃ¢ÂÂ Session filter (v3) Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
+    # ── Session filter (v3) ──────────────────────────────────────
     if not (Cfg.SESSION_START <= hour < Cfg.SESSION_END):
         return {"sig": "WATCH", "reason": f"off-session {hour}:xx UTC", "m": m}
 
-    # Ã¢ÂÂÃ¢ÂÂ Candle quality Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
+    # ── Candle quality ───────────────────────────────────────────
     rng  = h - l
     body = abs(c-o)/rng if rng > 0 else 0
     bull = c > o and body > 0.45
     bear = c < o and body > 0.45
 
-    # Ã¢ÂÂÃ¢ÂÂ Distance filter Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
+    # ── Distance filter ──────────────────────────────────────────
     near = dist < Cfg.PULL_PCT
 
     tr_d = "UP" if d5["tf_up"][i] else ("DOWN" if d5["tf_dn"][i] else "FLAT")
 
-    # Ã¢ÂÂÃ¢ÂÂ LONG signal Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
+    # ── LONG signal ──────────────────────────────────────────────
     if (d5["tf_up"][i]
             and near
             and rp < Cfg.RSI_LO and rc > rp       # RSI turning up from below 45
             and rc > Cfg.RSI_FLOOR
             and bull
-            and rsi_rise                             # Ã¢ÂÂ v3: RSI rising 2 bars
-            and (rsi_1h is None or rsi_1h > Cfg.RSI_1H_LO)):  # Ã¢ÂÂ v3: 1H filter
+            and rsi_rise                             # v3: RSI rising 2 bars
+            and (rsi_1h is None or rsi_1h > Cfg.RSI_1H_LO)):  # v3: 1H filter
         sl  = c - atr_val * Cfg.SL_MULT
         tp1 = c + atr_val * Cfg.TP1_MULT
         tp2 = c + atr_val * Cfg.TP2_MULT
@@ -310,18 +335,18 @@ def get_signal(d5, capital):
         be  = c + atr_val * Cfg.SL_MULT
         sz  = (capital * Cfg.RISK_PCT) / (atr_val * Cfg.SL_MULT)
         return {"sig": "LONG",
-                "reason": f"15M-UP EMA+RSI {rp:.0f}Ã¢ÂÂ{rc:.0f}",
+                "reason": f"15M-UP EMA+RSI {rp:.0f}→{rc:.0f}",
                 "m": m, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
                 "be": be, "sz": sz}
 
-    # Ã¢ÂÂÃ¢ÂÂ SHORT signal Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
+    # ── SHORT signal ─────────────────────────────────────────────
     if (d5["tf_dn"][i]
             and near
             and rp > Cfg.RSI_HI and rc < rp        # RSI turning down from above 60
             and rc < Cfg.RSI_CEIL
             and bear
-            and rsi_fall                             # Ã¢ÂÂ v3: RSI falling 2 bars
-            and (rsi_1h is None or rsi_1h < Cfg.RSI_1H_HI)):  # Ã¢ÂÂ v3: 1H filter
+            and rsi_fall                             # v3: RSI falling 2 bars
+            and (rsi_1h is None or rsi_1h < Cfg.RSI_1H_HI)):  # v3: 1H filter
         sl  = c + atr_val * Cfg.SL_MULT
         tp1 = c - atr_val * Cfg.TP1_MULT
         tp2 = c - atr_val * Cfg.TP2_MULT
@@ -329,7 +354,7 @@ def get_signal(d5, capital):
         be  = c - atr_val * Cfg.SL_MULT
         sz  = (capital * Cfg.RISK_PCT) / (atr_val * Cfg.SL_MULT)
         return {"sig": "SHORT",
-                "reason": f"15M-DOWN EMA+RSI {rp:.0f}Ã¢ÂÂ{rc:.0f}",
+                "reason": f"15M-DOWN EMA+RSI {rp:.0f}→{rc:.0f}",
                 "m": m, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
                 "be": be, "sz": sz}
 
@@ -341,12 +366,13 @@ def get_signal(d5, capital):
     return {"sig": "WATCH", "reason": reason, "m": m}
 
 
-# Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂ Exit check (partial TPs + breakeven) Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
+# ─── Exit check (partial TPs + breakeven) ────────────────────────────────────
 
 def check_exits(ot, d5):
-    """
-    Checks BE trigger, partial TP hits, and full close conditions.
-    Modifies ot in-place. Returns (events, fully_closed, close_reason,on, slose_px).
+    """Check BE trigger, partial TP hits, and full close conditions.
+
+    Modifies ot in-place. Returns (events, fully_closed, close_reason, close_px).
+    Events are strings like "TP1", "TP2", "BE_TRIGGERED" for executor integration.
     """
     i    = len(d5["ts"]) - 1
     h    = d5["h"][i]; l = d5["l"][i]; c = d5["c"][i]
@@ -354,7 +380,7 @@ def check_exits(ot, d5):
     dirn = ot["dir"]
     events = []
 
-    # Ã¢ÂÂÃ¢ÂÂ Breakeven trigger Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
+    # ── Breakeven trigger ────────────────────────────────────────
     if not ot.get("be_hit", False):
         if (dirn=="LONG"  and h >= ot["be"]) or \
            (dirn=="SHORT" and l <= ot["be"]):
@@ -364,7 +390,7 @@ def check_exits(ot, d5):
 
     sl = ot["sl"]
 
-    # Ã¢ÂÂÃ¢ÂÂ Partial TP hits Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
+    # ── Partial TP hits ──────────────────────────────────────────
     if dirn == "LONG":
         if not ot["tp1_hit"] and h >= ot["tp1"]:
             pnl = (ot["tp1"] - ot["entry"]) * ot["size"] * Cfg.TP1_FRAC
@@ -392,7 +418,7 @@ def check_exits(ot, d5):
             ot["pnl"] += pnl; ot["rem"] = 0; ot["tp3_hit"] = True
             events.append(f"TP3:+${pnl:.2f}")
 
-    # Ã¢ÂÂÃ¢ÂÂ Full close conditions Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
+    # ── Full close conditions ────────────────────────────────────
     if ot["tp3_hit"] or ot["rem"] <= 0:
         return events, True, "TP3", ot["tp3"]
 
@@ -413,9 +439,10 @@ def check_exits(ot, d5):
     return events, False, None, None
 
 
-# Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂ Telegram Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
+# ─── Telegram ─────────────────────────────────────────────────────────────────
 
 def tg(text):
+    """Send a message via Telegram bot API."""
     if not Cfg.TG_TOKEN or not Cfg.TG_CHAT_ID:
         log.info(f"[TG] {text[:120]}")
         return
@@ -428,36 +455,55 @@ def tg(text):
         log.warning(f"Telegram: {e}")
 
 def tg_opened(sym, ot):
-    tg(f"<b>{'Ã°ÂÂÂ' if ot['dir']=='LONG' else 'Ã°ÂÂÂ'} {sym} {ot['dir']} OPENED</b>\n"
+    """Send Telegram alert for new trade opened."""
+    mode = executor.get_mode_label()
+    exec_info = ""
+    if ot.get("exec_order_id"):
+        exec_info = (f"\nExec    : {mode}\n"
+                     f"Fill    : ${ot.get('exec_fill_price', 0):,.4f}\n"
+                     f"OrderID : {ot.get('exec_order_id', 'N/A')}")
+    else:
+        exec_info = f"\nExec    : {mode} (signal only)"
+
+    emoji = "\U0001f7e2" if ot['dir']=='LONG' else "\U0001f534"
+    tg(f"<b>{emoji} {sym} {ot['dir']} OPENED</b>\n"
        f"Entry : ${ot['entry']:,.4f}\n"
        f"TP1   : ${ot['tp1']:,.4f}  (40% close)\n"
        f"TP2   : ${ot['tp2']:,.4f}  (30% close)\n"
        f"TP3   : ${ot['tp3']:,.4f}  (30% close)\n"
        f"SL    : ${ot['sl']:,.4f}\n"
-       f"BE    : ${ot['be']:,.4f}  (SLÃ¢ÂÂentry when hit)\n"
-       f"Signal: {ot['reason']}")
+       f"BE    : ${ot['be']:,.4f}  (SL→entry when hit)\n"
+       f"Signal: {ot['reason']}"
+       f"{exec_info}")
 
 def tg_tp_hit(sym, ot, event):
-    tg(f"<b>Ã°ÂÂÂ¯ {sym} {event} HIT</b>\n"
+    """Send Telegram alert for partial TP hit."""
+    tg(f"<b>\U0001f3af {sym} {event} HIT</b>\n"
        f"Dir   : {ot['dir']}\n"
        f"Rem   : {ot['rem']*100:.0f}% still open\n"
        f"SL now: ${ot['sl']:,.4f}")
 
 def tg_closed(sym, ot, capital):
+    """Send Telegram alert for trade closed."""
     sign  = "+" if ot["pnl"] >= 0 else ""
-    emoji = "Ã¢ÂÂ WIN" if ot["pnl"]>0 else ("Ã¢ÂÂÃ¯Â¸Â BREAK" if ot["pnl"]==0 else "Ã¢ÂÂ LOSS")
+    emoji = "\u2705 WIN" if ot["pnl"]>0 else ("\u2696\ufe0f BREAK" if ot["pnl"]==0 else "\u274c LOSS")
     tp_lvl = ('TP3' if ot['tp3_hit'] else 'TP2' if ot['tp2_hit'] else 'TP1' if ot['tp1_hit'] else 'NONE')
-    tg(f"<b>{emoji} Ã¢ÂÂ {sym} {ot['dir']} closed ({ot.get('close_reason','?')})</b>\n"
+    mode = executor.get_mode_label()
+    tg(f"<b>{emoji} — {sym} {ot['dir']} closed ({ot.get('close_reason','?')})</b>\n"
        f"Entry    : ${ot['entry']:,.4f}\n"
        f"TP level : {tp_lvl}\n"
        f"P&L      : {sign}${ot['pnl']:,.2f}\n"
-       f"Capital  : ${capital:,.2f}")
+       f"Capital  : ${capital:,.2f}\n"
+       f"Mode     : {mode}")
 
 def tg_heartbeat(S):
+    """Send periodic heartbeat status via Telegram."""
     ret = (S["capital"]-Cfg.IC)/Cfg.IC*100
     mdd = (S["peak"]-S["capital"])/S["peak"]*100 if S["peak"]>0 else 0
+    mode = executor.get_mode_label()
     lines = [
-        f"<b>Ã°ÂÂÂ Heartbeat #{S['checks']}</b>",
+        f"<b>\U0001f4ca Heartbeat #{S['checks']}</b>",
+        f"Mode    : {mode}",
         f"Capital : ${S['capital']:,.2f} ({ret:+.2f}%)",
         f"MaxDD   : {mdd:.1f}%",
         f"Trades  : {len(S['trades'])} | Signals:{S['signals']} | Chops:{S['chops']}",
@@ -472,29 +518,225 @@ def tg_heartbeat(S):
             pos = "No position"
         wr = f"{ps.get('wins',0)}/{ps.get('trades',0)}" if ps.get('trades') else "0/0"
         lines.append(f"<b>{sym}</b>: {pos} | W/T:{wr} | P&L:${ps.get('pnl',0):+.0f}")
+
+    # Circuit breaker status
+    cb = executor.circuit_breaker
+    if cb.is_tripped():
+        lines.append(f"\n<b>\U0001f534 CIRCUIT BREAKER ACTIVE</b>\n{cb.trip_reason}")
+    else:
+        lines.append(f"\nConsec losses: {cb.consecutive_losses}/{executor.MAX_CONSECUTIVE_LOSSES}")
+
     tg("\n".join(lines))
 
+def tg_circuit_breaker(reason):
+    """Send urgent Telegram alert when circuit breaker trips."""
+    tg(f"<b>\U0001f6a8\U0001f6a8\U0001f6a8 CIRCUIT BREAKER TRIPPED \U0001f6a8\U0001f6a8\U0001f6a8</b>\n\n"
+       f"{reason}\n\n"
+       f"<b>NO NEW TRADES WILL BE PLACED.</b>\n"
+       f"Existing positions remain open with server-side SLs.\n\n"
+       f"To resume: set CIRCUIT_BREAKER_RESET=true in Railway env vars, "
+       f"then remove it after bot resumes.")
 
-# Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂ Main loop Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
+def tg_exec_error(sym, action, error):
+    """Send Telegram alert for execution errors."""
+    tg(f"<b>\u26a0\ufe0f EXECUTION ERROR</b>\n"
+       f"Symbol : {sym}\n"
+       f"Action : {action}\n"
+       f"Error  : {error}\n\n"
+       f"⚠️ Check Binance Futures position manually!")
+
+
+# ─── Execution integration helpers ───────────────────────────────────────────
+
+def execute_entry(sym: str, result: dict) -> dict:
+    """Execute a real entry order via executor.py.
+
+    Args:
+        sym: pair symbol (e.g. "BTCUSDT")
+        result: signal dict from get_signal()
+
+    Returns:
+        Updated trade dict with execution details, or None if execution failed.
+
+    🔴 RISK: This places real orders when TRADING_MODE=live
+    """
+    sig = result["sig"]
+    entry_price = result["m"]["px"]
+    sl_price = result["sl"]
+    size = result["sz"]
+
+    # Check circuit breaker before entry
+    if not executor.is_execution_enabled():
+        log.warning(f"{sym} SIGNAL {sig} blocked by circuit breaker")
+        tg(f"\u26d4 {sym} {sig} signal blocked — circuit breaker active")
+        return None
+
+    log.info(f"EXECUTING {sig} {sym}: size={size:.6f} entry≈{entry_price:.4f} SL={sl_price:.4f}")
+
+    exec_result = executor.open_position(
+        symbol=sym,
+        direction=sig,
+        size=size,
+        sl_price=sl_price,
+        entry_price=entry_price,
+    )
+
+    if not exec_result["success"]:
+        log.error(f"ENTRY FAILED for {sym}: {exec_result['error']}")
+        tg_exec_error(sym, f"{sig} ENTRY", exec_result["error"])
+        return None
+
+    # Build trade dict — use actual fill price if available
+    fill_price = exec_result["fill_price"] or entry_price
+    fill_qty = exec_result["fill_qty"] or size
+
+    new_ot = {
+        "symbol":         sym,
+        "dir":            sig,
+        "entry":          fill_price,  # 🔴 RISK: using actual fill, not signal price
+        "sl":             sl_price,
+        "tp1":            result["tp1"],
+        "tp2":            result["tp2"],
+        "tp3":            result["tp3"],
+        "be":             result["be"],
+        "size":           fill_qty,     # actual filled quantity
+        "be_hit":         False,
+        "tp1_hit":        False,
+        "tp2_hit":        False,
+        "tp3_hit":        False,
+        "rem":            1.0,
+        "pnl":            0.0,
+        "bars":           0,
+        "reason":         result["reason"],
+        "open_time":      datetime.now(timezone.utc).isoformat(),
+        # Execution tracking
+        "exec_order_id":  exec_result["order_id"],
+        "exec_sl_id":     exec_result["sl_order_id"],
+        "exec_fill_price": fill_price,
+    }
+
+    return new_ot
+
+
+def execute_partial_tp(sym: str, ot: dict, tp_level: str, fraction: float) -> None:
+    """Execute a partial TP close on the exchange.
+
+    Args:
+        sym: pair symbol
+        ot: open trade dict
+        tp_level: "TP1", "TP2", or "TP3"
+        fraction: fraction to close (0.40, 0.30, etc.)
+    """
+    result = executor.close_partial(
+        symbol=sym,
+        direction=ot["dir"],
+        fraction=fraction,
+        total_size=ot["size"],
+        reason=tp_level,
+    )
+    if not result["success"]:
+        log.error(f"{tp_level} execution failed for {sym}: {result['error']}")
+        tg_exec_error(sym, f"{tp_level} PARTIAL CLOSE", result["error"])
+
+    # After partial close, update the server-side SL to match reduced qty
+    remaining_qty = ot["size"] * ot["rem"]
+    if remaining_qty > 0:
+        sl_result = executor.update_sl_after_partial(
+            symbol=sym,
+            direction=ot["dir"],
+            sl_price=ot["sl"],
+            new_remaining_qty=remaining_qty,
+        )
+        if not sl_result["success"]:
+            log.error(f"SL update after {tp_level} failed: {sl_result['error']}")
+            tg_exec_error(sym, f"SL UPDATE after {tp_level}", sl_result["error"])
+
+
+def execute_breakeven(sym: str, ot: dict) -> None:
+    """Move the server-side stop-loss to breakeven (entry price)."""
+    remaining_qty = ot["size"] * ot["rem"]
+    result = executor.move_stop_loss(
+        symbol=sym,
+        direction=ot["dir"],
+        new_sl_price=ot["entry"],
+        remaining_qty=remaining_qty,
+    )
+    if not result["success"]:
+        log.error(f"BE move failed for {sym}: {result['error']}")
+        tg_exec_error(sym, "BREAKEVEN SL MOVE", result["error"])
+
+
+def execute_full_close(sym: str, ot: dict, reason: str) -> None:
+    """Close entire position on exchange (SL hit, timeout, TP3).
+
+    For SL hits detected by the bot (not server-side), we close via market order.
+    Server-side SL should handle crashes, but we also close explicitly for
+    timeout and TP3 completions.
+    """
+    # Cancel any remaining open orders (SL/limit) first
+    executor.cancel_open_orders(sym)
+
+    if reason == "SL" and not ot.get("be_hit"):
+        # Server-side SL should have already filled. Check if position is still open.
+        pos = executor.get_open_position(sym)
+        if pos is None or pos["qty"] <= 0:
+            log.info(f"{sym} SL already filled on exchange (server-side SL)")
+            return
+
+    # Close whatever remains
+    result = executor.close_full_position(sym, ot["dir"])
+    if not result["success"]:
+        log.error(f"FULL CLOSE failed for {sym}: {result['error']}")
+        tg_exec_error(sym, f"FULL CLOSE ({reason})", result["error"])
+
+
+# ─── Main loop ────────────────────────────────────────────────────────────────
 
 def main():
-    log.info("=== MTF BOT v3.0 Ã¢ÂÂ CHAMPION Ã¢ÂÂ BTC/ETH/SOL ===")
+    """Main bot loop with live execution integration."""
+    mode = executor.get_mode_label()
+    log.info(f"=== MTF BOT v4.1 — CHAMPION — BTC/ETH/SOL — {mode} ===")
     S = load_state()
+
+    # Restore circuit breaker from state
+    if S.get("circuit_breaker"):
+        executor.circuit_breaker = executor.CircuitBreaker.from_dict(S["circuit_breaker"])
+    executor.circuit_breaker.reset_daily(S["capital"])
+
     log.info(f"State: checks={S['checks']} capital=${S['capital']:.2f} trades={len(S['trades'])}")
-    tg(f"<b>Ã°ÂÂÂ MTF Bot v3.0 CHAMPION started</b>\n"
+
+    tg(f"<b>\U0001f680 MTF Bot v4.1 CHAMPION started</b>\n"
+       f"Mode     : {mode}\n"
+       f"Leverage : {executor.LEVERAGE}x\n"
        f"Pairs    : {', '.join(PAIRS)}\n"
-       f"TP 40/30/30% @ 4.5R / 7.2R / 18R\n"
-       f"Session  : 07Ã¢ÂÂ20 UTC only\n"
+       f"TP 40/30/30% @ 4.5R / 7.2R / 30R\n"
+       f"Session  : 07–20 UTC only\n"
        f"RSI mom  : 2-bar confirmation\n"
        f"1H RSI   : filter active\n"
        f"Capital  : ${S['capital']:,.2f}\n"
-       f"Backtest : PF 18.13 | MaxDD 1.5% | WR 56%")
+       f"Backtest : PF 18.13 | MaxDD 1.5% | WR 56%\n"
+       f"Circuit  : {executor.MAX_CONSECUTIVE_LOSSES} losses / "
+       f"{executor.DAILY_LOSS_LIMIT_PCT}% daily DD limit")
+
+    # Initialise exchange connection on startup
+    if executor.TRADING_MODE == "live":
+        try:
+            executor._get_exchange()
+            bal = executor.get_futures_balance()
+            log.info(f"Futures wallet balance: ${bal:.2f} USDT")
+            tg(f"\U0001f4b0 Futures balance: ${bal:.2f} USDT")
+        except Exception as e:
+            log.error(f"Exchange init failed: {e}")
+            tg(f"\u274c Exchange init failed: {e}\nBot will retry on first trade.")
 
     while True:
         loop_start = time.time()
         try:
             S["checks"] += 1
             log.info(f"=== Check #{S['checks']} ===")
+
+            # Reset daily circuit breaker tracking
+            executor.circuit_breaker.reset_daily(S["capital"])
 
             for sym in PAIRS:
                 try:
@@ -509,20 +751,32 @@ def main():
 
                     ps = S["pair_stats"].setdefault(sym, {"trades":0,"wins":0,"pnl":0.0})
 
-                    # Ã¢ÂÂÃ¢ÂÂ Exit check Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
+                    # ── Exit check ─────────────────────────────────
                     ot = S["open_trades"].get(sym)
                     if ot:
                         events, closed, c_reason, c_px = check_exits(ot, d5)
 
+                        # Execute events on exchange
                         for ev in events:
-                            if ev.startswith("TP"):
-                                tg_tp_hit(sym, ot, ev.split(":")[0])
+                            if ev.startswith("TP1"):
+                                execute_partial_tp(sym, ot, "TP1", Cfg.TP1_FRAC)
+                                tg_tp_hit(sym, ot, "TP1")
+                            elif ev.startswith("TP2"):
+                                execute_partial_tp(sym, ot, "TP2", Cfg.TP2_FRAC)
+                                tg_tp_hit(sym, ot, "TP2")
+                            elif ev.startswith("TP3"):
+                                # TP3 = full close, handled below
+                                tg_tp_hit(sym, ot, "TP3")
                             elif ev == "BE_TRIGGERED":
-                                tg(f"<b>Ã°ÂÂÂ {sym} Ã¢ÂÂ Breakeven triggered!</b>\n"
+                                execute_breakeven(sym, ot)
+                                tg(f"<b>\U0001f6e1 {sym} — Breakeven triggered!</b>\n"
                                    f"SL moved to entry: ${ot['entry']:,.4f}")
 
                         if closed:
                             ot["close_reason"] = c_reason
+                            # Execute full close on exchange
+                            execute_full_close(sym, ot, c_reason)
+
                             S["capital"] += ot["pnl"]
                             S["peak"]     = max(S["peak"], S["capital"])
                             S["trades"].append({**ot, "symbol":sym,
@@ -533,12 +787,17 @@ def main():
                             S["open_trades"].pop(sym)
                             log.info(f"{sym} CLOSED {c_reason} {ot['dir']} P&L ${ot['pnl']:+.2f} | cap=${S['capital']:.2f}")
                             tg_closed(sym, ot, S["capital"])
+
+                            # 🔴 RISK: Feed result to circuit breaker
+                            executor.circuit_breaker.record_trade(ot["pnl"], S["capital"])
+                            if executor.circuit_breaker.is_tripped():
+                                tg_circuit_breaker(executor.circuit_breaker.trip_reason)
                         else:
                             ep = ((px - ot["entry"]) if ot["dir"]=="LONG"
                                   else (ot["entry"] - px)) * ot["size"] * ot["rem"]
                             log.info(f"{sym} HOLDING {ot['dir']} {ot['bars']}bars rem:{ot['rem']*100:.0f}% est:${ep:+.2f}")
 
-                    # Ã¢ÂÂÃ¢ÂÂ Entry check Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
+                    # ── Entry check ────────────────────────────────
                     if sym not in S["open_trades"]:
                         result = get_signal(d5, S["capital"])
                         sig    = result["sig"]
@@ -549,32 +808,17 @@ def main():
                         if sig == "CHOP":
                             S["chops"] += 1
                         elif sig in ("LONG","SHORT"):
-                            new_ot = {
-                                "symbol":    sym,
-                                "dir":       sig,
-                                "entry":     result["m"]["px"],
-                                "sl":        result["sl"],
-                                "tp1":       result["tp1"],
-                                "tp2":       result["tp2"],
-                                "tp3":       result["tp3"],
-                                "be":        result["be"],
-                                "size":      result["sz"],
-                                "be_hit":    False,
-                                "tp1_hit":   False,
-                                "tp2_hit":   False,
-                                "tp3_hit":   False,
-                                "rem":       1.0,
-                                "pnl":       0.0,
-                                "bars":      0,
-                                "reason":    result["reason"],
-                                "open_time": datetime.now(timezone.utc).isoformat()
-                            }
-                            S["open_trades"][sym] = new_ot
-                            S["signals"] += 1
-                            log.info(f"{sym} {sig} entry={new_ot['entry']:.2f} "
-                                     f"TP1={new_ot['tp1']:.2f} TP2={new_ot['tp2']:.2f} "
-                                     f"TP3={new_ot['tp3']:.2f} SL={new_ot['sl']:.2f}")
-                            tg_opened(sym, new_ot)
+                            # 🔴 RISK: Execute real order
+                            new_ot = execute_entry(sym, result)
+                            if new_ot is not None:
+                                S["open_trades"][sym] = new_ot
+                                S["signals"] += 1
+                                log.info(f"{sym} {sig} entry={new_ot['entry']:.2f} "
+                                         f"TP1={new_ot['tp1']:.2f} TP2={new_ot['tp2']:.2f} "
+                                         f"TP3={new_ot['tp3']:.2f} SL={new_ot['sl']:.2f}")
+                                tg_opened(sym, new_ot)
+                            else:
+                                log.warning(f"{sym} {sig} signal generated but execution failed/blocked")
                     else:
                         log.info(f"{sym} ${px:,.2f} | in trade")
 
@@ -587,7 +831,7 @@ def main():
 
         except Exception as e:
             log.exception(f"Main loop error: {e}")
-            tg(f"Ã¢ÂÂ Ã¯Â¸Â Bot error: {e}\nRetrying in 5 min...")
+            tg(f"\u274c Bot error: {e}\nRetrying in 5 min...")
 
         elapsed = time.time() - loop_start
         time.sleep(max(5, Cfg.INTERVAL - elapsed))
