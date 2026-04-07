@@ -22,6 +22,14 @@ log = logging.getLogger("Executor")
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 TRADING_MODE = os.getenv("TRADING_MODE", "live").lower()  # "live" or "paper"
+
+# Log public IP on startup so we can whitelist it on Binance
+try:
+    import urllib.request as _urlreq
+    _pub_ip = _urlreq.urlopen("https://api.ipify.org", timeout=5).read().decode()
+    log.info(f"\U0001f310 Railway public IP: {_pub_ip}  \u2190 add this to Binance API whitelist")
+except Exception as _e:
+    log.warning(f"Could not fetch public IP: {_e}")
 DAILY_LOSS_LIMIT_PCT = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "5.0"))  # 🔴 RISK: halt after 5% daily DD
 MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))   # 🔴 RISK: halt after 3 losses in a row
 LEVERAGE = int(os.getenv("FUTURES_LEVERAGE", "1"))  # 🔴 RISK: default 1x, no leverage
