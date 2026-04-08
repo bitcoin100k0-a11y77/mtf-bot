@@ -498,7 +498,8 @@ def tg_closed(sym, ot, capital):
 
 def tg_heartbeat(S):
     """Send periodic heartbeat status via Telegram."""
-    ret = (S["capital"]-Cfg.IC)/Cfg.IC*100
+    sc  = S.get("start_capital") or Cfg.IC  # actual starting balance; fallback to IC
+    ret = (S["capital"] - sc) / sc * 100
     mdd = (S["peak"]-S["capital"])/S["peak"]*100 if S["peak"]>0 else 0
     mode = executor.get_mode_label()
     lines = [
@@ -718,16 +719,33 @@ def main():
        f"Circuit  : {executor.MAX_CONSECUTIVE_LOSSES} losses / "
        f"{executor.DAILY_LOSS_LIMIT_PCT}% daily DD limit")
 
-    # Initialise exchange connection on startup
-    if executor.TRADING_MODE == "live":
-        try:
+    # Initialise exchange connection on startup (live-only)
+    try:
             executor._get_exchange()
             bal = executor.get_futures_balance()
             log.info(f"Futures wallet balance: ${bal:.2f} USDT")
             tg(f"\U0001f4b0 Futures balance: ${bal:.2f} USDT")
-        except Exception as e:
-            log.error(f"Exchange init failed: {e}")
-            tg(f"\u274c Exchange init failed: {e}\nBot will retry on first trade.")
+            # 🔴 RISK: Sync S["capital"] to real balance so position sizing
+            # uses actual funds, not the virtual paper-mode IC ($10,000).
+            # Without this, sizing produces ~0.56 BTC on a $100 account.
+            if bal > 0:
+                S["capital"] = bal
+                # Fix stale IC peak: fresh_state() sets peak=IC ($10,000).
+                # On first real sync, reset peak to actual balance so MaxDD
+                # is not falsely reported as ~99%.  start_capital tracks the
+                # true starting balance for accurate return % in heartbeats.
+                if not S.get("start_capital"):
+                    S["start_capital"] = bal   # first sync: record real baseline
+                    S["peak"]          = bal   # reset stale IC peak to real balance
+                else:
+                    S["peak"] = max(S.get("peak", bal), bal)
+                log.info(f"Capital synced from Binance: ${bal:.2f} | peak=${S['peak']:.2f} | start=${S['start_capital']:.2f}")
+                # 🔴 RISK: Reset CB baseline NOW with real capital, not stale IC
+                executor.circuit_breaker.reset_daily(bal)
+    except Exception as e:
+        log.error(f"Exchange init failed: {e}")
+        tg(f"\u274c Exchange init failed: {e}\nBot will retry on first trade.")
+
 
     while True:
         loop_start = time.time()
