@@ -25,29 +25,32 @@ print("=" * 60)
 # 1. Key format checks
 print()
 print("--- API Key Format ---")
-print(f"  Key length     : {len(key)}  (expected: 64)")
-print(f"  Secret length  : {len(secret)}  (expected: 64)")
-print(f"  Key prefix     : {key[:6]}...  (should be alphanumeric)")
-print(f"  Has whitespace : {any(c in key for c in [' ', '\t', '\n', '\r'])}")
-print(f"  Has quotes     : {any(c in key for c in [chr(34), chr(39)])}")
-print(f"  All ASCII      : {all(ord(c) < 128 for c in key)}")
+print("  Key length    :", len(key), " (expected: 64)")
+print("  Secret length :", len(secret), " (expected: 64)")
+print("  Key prefix    :", key[:6] + "...  (should be alphanumeric)")
+has_ws = any(c in key for c in (" ", "\t", "\n", "\r"))
+has_q  = any(c in key for c in ('"', "'"))
+all_ascii = all(ord(c) < 128 for c in key)
+print("  Has whitespace:", has_ws)
+print("  Has quotes    :", has_q)
+print("  All ASCII     :", all_ascii)
 
 if len(key) != 64:
-    print(f"  [!] KEY LENGTH WRONG -- got {len(key)}, expected 64")
-    print("      Check .env: key may be truncated or has extra chars")
-elif not re.match(r'^[A-Za-z0-9]+$', key):
-    print("  [!] KEY CONTAINS NON-ALPHANUMERIC CHARS -- check for copy errors")
+    print("  [!] KEY LENGTH WRONG -- got", len(key), "expected 64")
+    print("      Check .env -- key may be truncated or has extra chars")
+elif not re.match(r"^[A-Za-z0-9]+$", key):
+    print("  [!] KEY HAS NON-ALPHANUMERIC CHARS -- check for copy errors")
 else:
     print("  [OK] Key format looks correct")
 
 if len(secret) != 64:
-    print(f"  [!] SECRET LENGTH WRONG -- got {len(secret)}, expected 64")
-elif not re.match(r'^[A-Za-z0-9]+$', secret):
-    print("  [!] SECRET CONTAINS NON-ALPHANUMERIC CHARS")
+    print("  [!] SECRET LENGTH WRONG -- got", len(secret), "expected 64")
+elif not re.match(r"^[A-Za-z0-9]+$", secret):
+    print("  [!] SECRET HAS NON-ALPHANUMERIC CHARS")
 else:
     print("  [OK] Secret format looks correct")
 
-# 2. Get current VPS IP (multiple methods)
+# 2. Get current VPS IP
 print()
 print("--- VPS Public IP ---")
 ip = None
@@ -62,24 +65,25 @@ for url in [
         ctx.verify_mode = ssl.CERT_NONE
         with urllib.request.urlopen(url, timeout=5, context=ctx) as r:
             ip = r.read().decode().strip()
-            print(f"  IP (from {url.split('/')[2]}): {ip}")
+            host = url.split("/")[2]
+            print("  IP (from " + host + "):", ip)
             break
     except Exception as e:
-        print(f"  {url.split('/')[2]}: failed ({e})")
+        host = url.split("/")[2]
+        print("  " + host + ": failed --", str(e)[:60])
 
 if ip:
     print()
-    print(f"  [ACTION REQUIRED] Whitelist this IP on Binance:")
-    print(f"  {ip}")
+    print("  >>> WHITELIST THIS IP ON BINANCE: " + ip)
     print()
-    print("  Steps:")
-    print("  1. Binance.com -> Profile -> API Management")
+    print("  How:")
+    print("  1. Binance.com -> Profile (top right) -> API Management")
     print("  2. Click Edit on your API key")
-    print("  3. Under 'Restrict access to trusted IPs only'")
-    print("  4. Add:", ip)
-    print("  5. Confirm via email, wait 5 min, restart bot")
+    print("  3. Restrict access to trusted IPs -> Add IP:", ip)
+    print("  4. Save -> confirm via email -> wait 5 min")
+    print("  5. Restart bot: sc stop ChampionBot && sc start ChampionBot")
 
-# 3. Quick connectivity test (unauthenticated)
+# 3. Connectivity test
 print()
 print("--- Binance Futures Connectivity ---")
 try:
@@ -89,30 +93,13 @@ try:
     with urllib.request.urlopen(
         "https://fapi.binance.com/fapi/v1/ping", timeout=5, context=ctx
     ) as r:
-        print(f"  [OK] fapi.binance.com reachable (status {r.status})")
+        print("  [OK] fapi.binance.com reachable")
 except Exception as e:
-    print(f"  [FAIL] Cannot reach fapi.binance.com: {e}")
+    print("  [FAIL] Cannot reach fapi.binance.com:", str(e)[:80])
 
-# 4. Root cause summary
 print()
 print("=" * 60)
-print("  ROOT CAUSE SUMMARY")
+print("  SUMMARY: error -2008 = IP not whitelisted (most likely)")
+print("  Add the IP above to your Binance API key, then restart.")
+print("  In PAPER mode this only blocks balance queries -- safe.")
 print("=" * 60)
-print()
-print("  Error -2008 means Binance rejected the API key.")
-print("  Most common causes (in order):")
-print()
-print("  1. IP NOT WHITELISTED (most likely)")
-print("     -> Binance returns -2008 for IP-restricted keys")
-print("        when the request comes from an unlisted IP.")
-print("     -> Fix: add the IP shown above to your API key.")
-print()
-print("  2. WRONG API KEY (less likely if format checks passed)")
-print("     -> Key was copied incorrectly or is for Spot, not Futures.")
-print("     -> Fix: regenerate API key on Binance Futures.")
-print()
-print("  3. KEY DISABLED/DELETED")
-print("     -> Check Binance API Management page.")
-print()
-print("  In PAPER mode: -2008 only blocks balance queries.")
-print("  The bot continues running -- no real orders affected.")
