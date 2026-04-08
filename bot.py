@@ -746,6 +746,13 @@ def main():
         log.error(f"Exchange init failed: {e}")
         tg(f"\u274c Exchange init failed: {e}\nBot will retry on first trade.")
 
+    # 🔴 RISK: Fallback — if Binance sync failed (e.g. IP not whitelisted yet),
+    # seed start_capital from whatever is in the state file so the heartbeat
+    # never reports the false 99% MaxDD caused by the stale IC peak ($10,000).
+    if not S.get("start_capital") and S["capital"] > 0:
+        S["start_capital"] = S["capital"]
+        S["peak"]          = S["capital"]   # reset stale IC peak even without live sync
+        log.info(f"Fallback: start_capital=${S['start_capital']:.2f} seeded from state file (Binance sync unavailable)")
 
     while True:
         loop_start = time.time()
