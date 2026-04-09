@@ -264,16 +264,17 @@ def open_position(
 
     # 2) Server-side stop-loss (stop-market order)
     try:
-        log.info(f"PLACING SL {sl_side} {fill_qty} {ccxt_sym} @ {sl_px}")
+        log.info(f"PLACING SL {sl_side} closePosition {ccxt_sym} @ {sl_px}")
         sl_order = ex.create_order(
             symbol=ccxt_sym,
             type="stop_market",  # Binance Futures stop-market
             side=sl_side,
-            amount=fill_qty,
+            amount=fill_qty,     # ignored by Binance when closePosition=True
             params={
                 "stopPrice": sl_px,
-                "closePosition": False,
-                "reduceOnly": True,
+                "closePosition": True,  # 🔴 FIX: avoids -4120; closes full remaining position
+                # reduceOnly=True with STOP_MARKET now requires Algo Order endpoint (-4120)
+                # closePosition=True uses standard /fapi/v1/order and is semantically correct
             },
         )
         result["sl_order_id"] = sl_order.get("id", "unknown")
@@ -458,16 +459,16 @@ def move_stop_loss(
         time.sleep(0.3)  # brief pause after cancellation
 
         # Place new SL
-        log.info(f"NEW SL: {sl_side} {qty} {ccxt_sym} @ {sl_px}")
+        log.info(f"NEW SL: {sl_side} closePosition {ccxt_sym} @ {sl_px}")
         sl_order = ex.create_order(
             symbol=ccxt_sym,
             type="stop_market",
             side=sl_side,
-            amount=qty,
+            amount=qty,          # ignored by Binance when closePosition=True
             params={
                 "stopPrice": sl_px,
-                "closePosition": False,
-                "reduceOnly": True,
+                "closePosition": True,  # 🔴 FIX: avoids -4120; closes full remaining position
+                # reduceOnly=True with STOP_MARKET now requires Algo Order endpoint (-4120)
             },
         )
         result.update({"success": True, "sl_order_id": sl_order.get("id", "unknown")})
