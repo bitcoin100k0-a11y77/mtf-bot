@@ -1,4 +1,4 @@
-# executor.py — Binance Futures order execu   tion for Champion v4.0
+# executor.py — Binance Futures order execution for Champion v4.0
 """
 Binance USD-M Futures execution layer.
 
@@ -21,19 +21,19 @@ log = logging.getLogger("Executor")
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-TRADING_MODE = os.getenv("TRADING_MODE", "live").lower()  # "live" or "paper"
+# Bot is live-only — paper mode removed
 
 # Get public IPv4 on startup and send to Telegram so it can be whitelisted on Binance
 try:
     import urllib.request as _urlreq
     import json as _json
     _pub_ip = _urlreq.urlopen("https://api4.ipify.org", timeout=5).read().decode().strip()
-    log.info(f"Railway public IPv4: {_pub_ip}")
-    # Send IP to Telegram so it's visible even if Railway redacts logs
+    log.info(f"VPS public IPv4: {_pub_ip}")
+    # Send IP to Telegram so it's visible for Binance whitelist verification
     _tg_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
     _tg_chat  = os.getenv("TELEGRAM_CHAT_ID", "")
     if _tg_token and _tg_chat:
-        _msg = f"\U0001f310 Railway public IPv4: {_pub_ip}\n\nAdd this to Binance API key whitelist to enable Futures."
+        _msg = f"🌐 VPS public IPv4: {_pub_ip}\n\nAdd this to Binance API key whitelist if not already done."
         _tg_url = f"https://api.telegram.org/bot{_tg_token}/sendMessage"
         _tg_data = _json.dumps({"chat_id": _tg_chat, "text": _msg}).encode()
         _req = _urlreq.Request(_tg_url, data=_tg_data, headers={"Content-Type": "application/json"})
@@ -103,13 +103,26 @@ def _init_leverage(symbol: str) -> None:
 # ─── Precision helpers ────────────────────────────────────────────────────────
 
 def _round_qty(symbol: str, qty: float) -> float:
-    """Round quantity to exchange precision to avoid Binance rejection."""
+    """Round quantity to exchange precision to avoid Binance rejection.
+
+    CCXT returns precision.amount in two possible modes:
+    - TICK_SIZE mode:      float < 1, e.g. 0.001 (the step size itself)
+    - DECIMAL_PLACES mode: integer >= 1, e.g. 3 (number of decimal places)
+    Binance Futures uses TICK_SIZE mode, so 10**precision gives ~1.002
+    which causes math.floor(0.567 * 1.002) = 0 — wrong. Detect and handle both.
+    """
     ex = _get_exchange()
     market = ex.market(symbol)
     precision = market.get("precision", {}).get("amount", 8)
     # Use floor to never exceed available balance
-    factor = 10 ** precision
-    return math.floor(qty * factor) / factor
+    if isinstance(precision, float) and precision < 1:
+        # TICK_SIZE mode: precision IS the step size (e.g. 0.001 for BTCUSDT)
+        step = precision
+        return math.floor(qty / step) * step
+    else:
+        # DECIMAL_PLACES mode: precision is the number of decimal places
+        factor = 10 ** int(precision)
+        return math.floor(qty * factor) / factor
 
 
 def _round_price(symbol: str, price: float) -> float:
@@ -142,10 +155,14 @@ def get_futures_balance() -> float:
     Returns:
         float: Available USDT balance, or 0.0 on error.
     """
-    if TRADING_MODE == "paper":
-        log.info("[PAPER] get_futures_balance → returning 0 (use virtual capital)")
-        return 0.0
+    try:
+        ex = _get_exchange()
+        balance = ex.fetch_balance()
+        usdt = balance.get("USDTutures wallet.
 
+    Returns:
+        float: Available USDT balance, or 0.0 on error.
+    """
     try:
         ex = _get_exchange()
         balance = ex.fetch_balance()
@@ -165,9 +182,6 @@ def get_open_position(symbol: str) -> Optional[dict]:
         dict with keys: side ('long'/'short'), qty, entry_price, unrealized_pnl
         or None if no position.
     """
-    if TRADING_MODE == "paper":
-        return None
-
     try:
         ex = _get_exchange()
         ccxt_sym = _symbol_to_ccxt(symbol)
@@ -225,15 +239,6 @@ def open_position(
     if qty <= 0:
         result["error"] = f"Quantity rounds to 0 for {symbol} (raw: {size})"
         log.error(result["error"])
-        return result
-
-    # ── Paper mode: log but don't execute ──
-    if TRADING_MODE == "paper":
-        log.info(f"[PAPER] {direction} {qty} {symbol} @ ~{entry_price:.4f} | SL={sl_px:.4f}")
-        result.update({
-            "success": True, "order_id": "PAPER",
-            "sl_order_id": "PAPER", "fill_price": entry_price, "fill_qty": qty,
-        })
         return result
 
     # ── Live execution ──
@@ -320,11 +325,6 @@ def close_partial(
         log.warning(result["error"])
         return result
 
-    if TRADING_MODE == "paper":
-        log.info(f"[PAPER] {reason} close {close_side} {qty} {symbol}")
-        result.update({"success": True, "fill_price": 0.0, "fill_qty": qty})
-        return result
-
     try:
         ex = _get_exchange()
         log.info(f"{reason}: closing {fraction*100:.0f}% → {close_side} {qty} {ccxt_sym}")
@@ -349,6 +349,10 @@ def close_partial(
 def close_full_position(symbol: str, direction: str) -> dict:
     """Close entire remaining position (for SL hit, timeout, TP3).
 
+    Handles sub-minimum dust positions (left after partial TP closes) via a
+    closePosition=True STOP_MARKET at an aggressively-priced trigger — the same
+    proven approach used for server-side SL orders.
+
     Args:
         symbol: e.g. "BTCUSDT"
         direction: "LONG" or "SHORT"
@@ -361,14 +365,9 @@ def close_full_position(symbol: str, direction: str) -> dict:
 
     result = {"success": False, "fill_price": None, "error": None}
 
-    if TRADING_MODE == "paper":
-        log.info(f"[PAPER] FULL CLOSE {close_side} {symbol}")
-        result.update({"success": True, "fill_price": 0.0})
-        return result
-
     try:
         ex = _get_exchange()
-        # Fetch current position to get exact quantity
+        # Fetch current position directly from Binance for exact quantity
         pos = get_open_position(symbol)
         if pos is None or pos["qty"] <= 0:
             log.warning(f"No open position found for {symbol} — nothing to close")
@@ -376,6 +375,59 @@ def close_full_position(symbol: str, direction: str) -> dict:
             return result
 
         qty = _round_qty(ccxt_sym, pos["qty"])
+
+        if qty <= 0:
+            # Qty rounds to zero — pure dust, no order possible
+            log.warning(f"{symbol}: rounded qty = 0 (raw {pos['qty']:.6f}) — dust position, treating as closed")
+            result.update({"success": True, "fill_price": pos.get("entry_price", 0.0)})
+            return result
+
+        # ── Check against exchange minimum lot size ──────────────────────────
+        market_info = ex.market(ccxt_sym)
+        limits = (market_info.get("limits") or {})
+        min_qty = float((limits.get("amount") or {}).get("min") or 0.0)
+
+        if min_qty > 0 and qty < min_qty:
+            # 🔴 FIX: position is below Binance minimum lot size (dust after partial TPs).
+            # Regular market order with `amount=qty` is rejected with -1111.
+            # Fallback: STOP_MARKET + closePosition=True, same as server-side SL.
+            # Trigger price is set 0.5% away from current market — fires on next tick.
+            log.warning(
+                f"{symbol} dust position {qty:.6f} < min {min_qty:.4f} — "
+                f"falling back to closePosition STOP_MARKET"
+            )
+            try:
+                ticker = ex.fetch_ticker(ccxt_sym)
+                cur_px = float(ticker["last"])
+            except Exception as te:
+                log.warning(f"Ticker fetch failed for {symbol}: {te} — using entry price as reference")
+                cur_px = pos.get("entry_price", 1.0)
+
+            # LONG close (SELL STOP_MARKET): triggers when price drops TO stopPrice
+            # → set 0.5% below current; fires on any small dip, typically within seconds
+            # SHORT close (BUY STOP_MARKET): triggers when price rises TO stopPrice
+            # → set 0.5% above current; same logic
+            if direction == "LONG":
+                stop_px = _round_price(ccxt_sym, cur_px * 0.995)
+            else:
+                stop_px = _round_price(ccxt_sym, cur_px * 1.005)
+
+            log.info(f"DUST CLOSE: {close_side} closePosition {ccxt_sym} @ stop={stop_px} (cur={cur_px:.4f})")
+            dust_order = ex.create_order(
+                symbol=ccxt_sym,
+                type="stop_market",
+                side=close_side,
+                amount=pos["qty"],   # ignored by Binance when closePosition=True
+                params={
+                    "stopPrice": stop_px,
+                    "closePosition": True,  # closes full remaining position, bypasses qty minimum
+                },
+            )
+            log.info(f"DUST CLOSE order placed: {dust_order.get('id', 'unknown')} @ stop={stop_px}")
+            result.update({"success": True, "fill_price": cur_px})
+            return result
+
+        # ── Normal close — position is above minimum lot size ────────────────
         log.info(f"FULL CLOSE: {close_side} {qty} {ccxt_sym}")
         order = ex.create_order(
             symbol=ccxt_sym,
@@ -400,10 +452,6 @@ def cancel_open_orders(symbol: str) -> bool:
     Returns:
         bool: True if cancelled successfully or no orders to cancel.
     """
-    if TRADING_MODE == "paper":
-        log.info(f"[PAPER] cancel_open_orders {symbol}")
-        return True
-
     try:
         ex = _get_exchange()
         ccxt_sym = _symbol_to_ccxt(symbol)
@@ -445,11 +493,6 @@ def move_stop_loss(
     qty = _round_qty(ccxt_sym, remaining_qty)
 
     result = {"success": False, "sl_order_id": None, "error": None}
-
-    if TRADING_MODE == "paper":
-        log.info(f"[PAPER] move SL for {symbol} to {sl_px}")
-        result.update({"success": True, "sl_order_id": "PAPER"})
-        return result
 
     try:
         ex = _get_exchange()
@@ -550,13 +593,13 @@ class CircuitBreaker:
         Also checks for manual reset via env var.
         """
         if self.tripped:
-            # Allow manual reset via Railway env var
+            # Allow manual reset via .env file (CIRCUIT_BREAKER_RESET=true)
             if os.getenv("CIRCUIT_BREAKER_RESET", "").lower() == "true":
                 log.info("Circuit breaker manually reset via CIRCUIT_BREAKER_RESET env var")
                 self.tripped = False
                 self.trip_reason = ""
                 self.consecutive_losses = 0
-                # Note: CIRCUIT_BREAKER_RESET should be removed from Railway after reset
+                # Note: Remove CIRCUIT_BREAKER_RESET from .env after bot resumes
         return self.tripped
 
     def to_dict(self) -> dict:
@@ -595,4 +638,4 @@ def get_mode_label() -> str:
     """Return human-readable mode string for Telegram/logging."""
     if circuit_breaker.is_tripped():
         return "🔴 HALTED (circuit breaker)"
-    return f"{'🟢 LIVE' if TRADING_MODE == 'live' else '🟡 PAPER'}"
+    return "🟢 LIVE"
