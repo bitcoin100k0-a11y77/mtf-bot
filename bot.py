@@ -79,10 +79,10 @@ class Cfg:
 
     MAX_HOLD    = 48          # max bars before forced exit (5-min bars = 4 hours)
     IC          = 10_000.0    # initial capital (virtual tracking)
-    RISK_PCT    = 0.0075      # 🔴 RISK: 0.75% risk per trade
+    RISK_PCT    = 0.01        # 🔴 RISK: 1.0% risk per trade
 
     INTERVAL    = 300         # check every 5 minutes
-    STATE_FILE  = Path(os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "/data")) / "bot_state.json"
+    STATE_FILE  = Path(os.getenv("BOT_DATA_DIR", os.getenv("RAILWAY_VOLUME_MOUNT_PATH", r"C:\botdata"))) / "bot_state.json"
 
 
 # ─── Indicators ───────────────────────────────────────────────────────────────
@@ -535,8 +535,8 @@ def tg_circuit_breaker(reason):
        f"{reason}\n\n"
        f"<b>NO NEW TRADES WILL BE PLACED.</b>\n"
        f"Existing positions remain open with server-side SLs.\n\n"
-       f"To resume: set CIRCUIT_BREAKER_RESET=true in Railway env vars, "
-       f"then remove it after bot resumes.")
+       f"To resume: set CIRCUIT_BREAKER_RESET=true in .env on the VPS, "
+       f"then restart. Remove the var after trading resumes.")
 
 def tg_exec_error(sym, action, error):
     """Send Telegram alert for execution errors."""
@@ -667,12 +667,15 @@ def execute_breakeven(sym: str, ot: dict) -> None:
         tg_exec_error(sym, "BREAKEVEN SL MOVE", result["error"])
 
 
-def execute_full_close(sym: str, ot: dict, reason: str) -> None:
+def execute_full_close(sym: str, ot: dict, reason: str) -> bool:
     """Close entire position on exchange (SL hit, timeout, TP3).
 
-    For SL hits detected by the bot (not server-side), we close via market order.
-    Server-side SL should handle crashes, but we also close explicitly for
-    timeout and TP3 completions.
+    Returns True if the position is confirmed closed (or already gone).
+    Returns False if the close attempt failed — caller MUST NOT pop the trade
+    from open_trades; it will be retried next check cycle.
+
+    🔴 RISK: Returning False means position is still open on Binance.
+    The server-side SL (closePosition=True) remains the safety net.
     """
     # Cancel any remaining open orders (SL/limit) first
     executor.cancel_open_orders(sym)
@@ -682,13 +685,15 @@ def execute_full_close(sym: str, ot: dict, reason: str) -> None:
         pos = executor.get_open_position(sym)
         if pos is None or pos["qty"] <= 0:
             log.info(f"{sym} SL already filled on exchange (server-side SL)")
-            return
+            return True
 
     # Close whatever remains
     result = executor.close_full_position(sym, ot["dir"])
     if not result["success"]:
         log.error(f"FULL CLOSE failed for {sym}: {result['error']}")
         tg_exec_error(sym, f"FULL CLOSE ({reason})", result["error"])
+        return False
+    return True
 
 
 # ─── Main loop ────────────────────────────────────────────────────────────────
@@ -702,7 +707,8 @@ def main():
     # Restore circuit breaker from state
     if S.get("circuit_breaker"):
         executor.circuit_breaker = executor.CircuitBreaker.from_dict(S["circuit_breaker"])
-    executor.circuit_breaker.reset_daily(S["capital"])
+    # NOTE: reset_daily is called AFTER balance sync below, not here
+    # Calling it here with stale S["capital"] caused 99% false drawdown trips
 
     log.info(f"State: checks={S['checks']} capital=${S['capital']:.2f} trades={len(S['trades'])}")
 
@@ -799,24 +805,33 @@ def main():
 
                         if closed:
                             ot["close_reason"] = c_reason
-                            # Execute full close on exchange
-                            execute_full_close(sym, ot, c_reason)
+                            # 🔴 RISK: Only book P&L and remove trade if close ACTUALLY succeeded.
+                            # If close fails (e.g. sub-minimum qty, network), keep trade in
+                            # open_trades — it will be retried next cycle. Server-side SL
+                            # (closePosition=True) remains the safety net while retrying.
+                            close_ok = execute_full_close(sym, ot, c_reason)
+                            if not close_ok:
+                                log.error(f"{sym} {c_reason} CLOSE FAILED — keeping in open_trades, will retry next cycle")
+                                tg_exec_error(sym, f"{c_reason} RETRY PENDING",
+                                              "Close failed. Will retry next cycle. Server-side SL active.")
+                                # Increment bars so TIME logic re-triggers close next check
+                                ot["bars"] = max(ot["bars"], Cfg.MAX_HOLD)
+                            else:
+                                S["capital"] += ot["pnl"]
+                                S["peak"]     = max(S["peak"], S["capital"])
+                                S["trades"].append({**ot, "symbol":sym,
+                                    "close_time": datetime.now(timezone.utc).isoformat()})
+                                ps["trades"] += 1
+                                ps["pnl"]    += ot["pnl"]
+                                if ot["pnl"] > 0: ps["wins"] += 1
+                                S["open_trades"].pop(sym)
+                                log.info(f"{sym} CLOSED {c_reason} {ot['dir']} P&L ${ot['pnl']:+.2f} | cap=${S['capital']:.2f}")
+                                tg_closed(sym, ot, S["capital"])
 
-                            S["capital"] += ot["pnl"]
-                            S["peak"]     = max(S["peak"], S["capital"])
-                            S["trades"].append({**ot, "symbol":sym,
-                                "close_time": datetime.now(timezone.utc).isoformat()})
-                            ps["trades"] += 1
-                            ps["pnl"]    += ot["pnl"]
-                            if ot["pnl"] > 0: ps["wins"] += 1
-                            S["open_trades"].pop(sym)
-                            log.info(f"{sym} CLOSED {c_reason} {ot['dir']} P&L ${ot['pnl']:+.2f} | cap=${S['capital']:.2f}")
-                            tg_closed(sym, ot, S["capital"])
-
-                            # 🔴 RISK: Feed result to circuit breaker
-                            executor.circuit_breaker.record_trade(ot["pnl"], S["capital"])
-                            if executor.circuit_breaker.is_tripped():
-                                tg_circuit_breaker(executor.circuit_breaker.trip_reason)
+                                # 🔴 RISK: Feed result to circuit breaker only on confirmed close
+                                executor.circuit_breaker.record_trade(ot["pnl"], S["capital"])
+                                if executor.circuit_breaker.is_tripped():
+                                    tg_circuit_breaker(executor.circuit_breaker.trip_reason)
                         else:
                             ep = ((px - ot["entry"]) if ot["dir"]=="LONG"
                                   else (ot["entry"] - px)) * ot["size"] * ot["rem"]
