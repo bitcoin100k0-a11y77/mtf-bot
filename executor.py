@@ -1,4 +1,4 @@
-# executor.py — Binance Futures order execu  tion for Champion v4.0
+# executor.py — Binance Futures order execu   tion for Champion v4.0
 """
 Binance USD-M Futures execution layer.
 
