@@ -158,14 +158,6 @@ def get_futures_balance() -> float:
     try:
         ex = _get_exchange()
         balance = ex.fetch_balance()
-        usdt = balance.get("USDTutures wallet.
-
-    Returns:
-        float: Available USDT balance, or 0.0 on error.
-    """
-    try:
-        ex = _get_exchange()
-        balance = ex.fetch_balance()
         usdt = balance.get("USDT", {})
         free = float(usdt.get("free", 0.0))
         log.info(f"Futures balance: {free:.2f} USDT")
