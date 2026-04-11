@@ -591,6 +591,13 @@ class CircuitBreaker:
                 self.tripped = False
                 self.trip_reason = ""
                 self.consecutive_losses = 0
+                # 🔴 FIX: Clear the daily baseline so reset_daily() is forced to
+                # re-initialise with current real capital on the next call.
+                # Without this, daily_start_capital remains stale (e.g. $114 before
+                # losses) causing the drawdown check to re-trip the breaker immediately
+                # after reset — even before a new trade is placed.
+                self.daily_start_capital = 0.0
+                self.daily_start_date = ""
                 # Note: Remove CIRCUIT_BREAKER_RESET from .env after bot resumes
         return self.tripped
 
