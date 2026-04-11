@@ -414,6 +414,7 @@ def get_signal(d5, capital):
     near = dist < Cfg.PULL_PCT
 
     tr_d = "UP" if d5["tf_up"][i] else ("DOWN" if d5["tf_dn"][i] else "FLAT")
+    m["tr"] = tr_d  # expose 15M trend to log display (was missing — caused 15M:? in logs)
 
     # ── LONG signal ──────────────────────────────────────────────
     if (d5["tf_up"][i]
