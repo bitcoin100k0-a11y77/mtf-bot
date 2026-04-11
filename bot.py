@@ -813,10 +813,16 @@ def main():
     # Resetting here ensures the logged count reflects the current session only.
     executor.circuit_breaker.consecutive_losses = 0
 
-    # 🔴 FIX: Auto-clear any existing trip caused by the now-removed consecutive-loss
-    # check. Trips from daily drawdown remain active (they represent real risk events).
+    # 🔴 FIX: Auto-clear stale CB trips on startup.
+    # Two scenarios that warrant auto-clear:
+    #   (a) Consecutive-loss trip — trigger permanently removed from executor.py.
+    #       These trips can never be legitimate anymore.
+    #   (b) Daily-DD trip from a PREVIOUS UTC day — yesterday's drawdown cannot
+    #       apply to today's trading.  A new day means a fresh daily baseline.
     if executor.circuit_breaker.tripped:
         reason = executor.circuit_breaker.trip_reason
+        cb_date = executor.circuit_breaker.daily_start_date
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if "consecutive losses" in reason or "consecutive loss" in reason:
             log.warning(
                 f"CB: Auto-clearing stale consecutive-loss trip (trigger permanently removed).\n"
@@ -825,6 +831,14 @@ def main():
             executor.circuit_breaker.tripped = False
             executor.circuit_breaker.trip_reason = ""
             log.info("CB: Bot will resume trading. Consecutive-loss trigger is disabled.")
+        elif cb_date and cb_date != today:
+            log.warning(
+                f"CB: Auto-clearing stale daily-DD trip from {cb_date} (today is {today}).\n"
+                f"Old reason: {reason}"
+            )
+            executor.circuit_breaker.tripped = False
+            executor.circuit_breaker.trip_reason = ""
+            log.info("CB: Bot will resume trading on new UTC day.")
 
     log.info(f"State: checks={S['checks']} capital=${S['capital']:.2f} trades={len(S['trades'])}")
 
@@ -980,17 +994,24 @@ def main():
                         if sig == "CHOP":
                             S["chops"] += 1
                         elif sig in ("LONG","SHORT"):
-                            # 🔴 RISK: Execute real order
-                            new_ot = execute_entry(sym, result)
-                            if new_ot is not None:
-                                S["open_trades"][sym] = new_ot
-                                S["signals"] += 1
-                                log.info(f"{sym} {sig} entry={new_ot['entry']:.2f} "
-                                         f"TP1={new_ot['tp1']:.2f} TP2={new_ot['tp2']:.2f} "
-                                         f"TP3={new_ot['tp3']:.2f} SL={new_ot['sl']:.2f}")
-                                tg_opened(sym, new_ot)
+                            if executor.circuit_breaker.is_tripped():
+                                # 🔴 RISK: CB active — block entry (trip already logged)
+                                log.warning(
+                                    f"{sym} Signal {sig} BLOCKED — circuit breaker active: "
+                                    f"{executor.circuit_breaker.trip_reason}"
+                                )
                             else:
-                                log.warning(f"{sym} {sig} signal generated but execution failed/blocked")
+                                # 🔴 RISK: Execute real order
+                                new_ot = execute_entry(sym, result)
+                                if new_ot is not None:
+                                    S["open_trades"][sym] = new_ot
+                                    S["signals"] += 1
+                                    log.info(f"{sym} {sig} entry={new_ot['entry']:.2f} "
+                                             f"TP1={new_ot['tp1']:.2f} TP2={new_ot['tp2']:.2f} "
+                                             f"TP3={new_ot['tp3']:.2f} SL={new_ot['sl']:.2f}")
+                                    tg_opened(sym, new_ot)
+                                else:
+                                    log.warning(f"{sym} {sig} signal generated but execution failed/blocked")
                     else:
                         log.info(f"{sym} ${px:,.2f} | in trade")
 
