@@ -805,6 +805,26 @@ def main():
     # NOTE: reset_daily is called AFTER balance sync below, not here
     # Calling it here with stale S["capital"] caused 99% false drawdown trips
 
+    # 🔴 FIX: Always reset consecutive_losses to 0 on every startup.
+    # The counter was persisted in JSON and accumulated ACROSS restarts — pre-restart
+    # losses carried forward, so one more real loss immediately tripped the CB.
+    # consecutive_losses is now INFORMATIONAL ONLY (trip removed from executor.py).
+    # Resetting here ensures the logged count reflects the current session only.
+    executor.circuit_breaker.consecutive_losses = 0
+
+    # 🔴 FIX: Auto-clear any existing trip caused by the now-removed consecutive-loss
+    # check. Trips from daily drawdown remain active (they represent real risk events).
+    if executor.circuit_breaker.tripped:
+        reason = executor.circuit_breaker.trip_reason
+        if "consecutive losses" in reason or "consecutive loss" in reason:
+            log.warning(
+                f"CB: Auto-clearing stale consecutive-loss trip (trigger permanently removed).\n"
+                f"Old reason: {reason}"
+            )
+            executor.circuit_breaker.tripped = False
+            executor.circuit_breaker.trip_reason = ""
+            log.info("CB: Bot will resume trading. Consecutive-loss trigger is disabled.")
+
     log.info(f"State: checks={S['checks']} capital=${S['capital']:.2f} trades={len(S['trades'])}")
 
     tg(f"<b>\U0001f680 MTF Bot v4.1 CHAMPION started</b>\n"
@@ -817,8 +837,8 @@ def main():
        f"1H RSI   : filter active\n"
        f"Capital  : ${S['capital']:,.2f}\n"
        f"Backtest : PF 18.13 | MaxDD 1.5% | WR 56%\n"
-       f"Circuit  : {executor.MAX_CONSECUTIVE_LOSSES} losses / "
-       f"{executor.DAILY_LOSS_LIMIT_PCT}% daily DD limit")
+       f"Circuit  : DD {executor.DAILY_LOSS_LIMIT_PCT}% daily limit only "
+       f"(consec-loss CB disabled — see executor.py)")
 
     # Initialise exchange connection on startup (live-only)
     try:
