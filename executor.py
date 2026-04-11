@@ -552,30 +552,45 @@ class CircuitBreaker:
             log.info(f"Circuit breaker daily reset: start capital = ${capital:.2f}")
 
     def record_trade(self, pnl: float, capital: float) -> None:
-        """Record a completed trade. May trip the breaker."""
+        """Record a completed trade. Checks DAILY DRAWDOWN ONLY.
+
+        The consecutive-loss check has been permanently disabled.
+
+        WHY: consecutive_losses persists in bot_state.json across restarts.
+        Pre-restart losses carried forward into the new session, causing false
+        CB trips on the very next real loss even after clean restarts. The
+        trigger was state-file corruption — not actual risk events.
+
+        The daily drawdown check is the ONLY remaining trip trigger because:
+          - It uses real Binance balance (synced from exchange on every startup)
+          - It resets to actual balance each UTC day
+          - It cannot be faked by phantom trades or JSON state artifacts
+          - 5% daily DD on a real account is always a meaningful signal
+
+        🔴 RISK: consecutive_losses is now INFORMATIONAL ONLY — logged for
+        monitoring and displayed in heartbeat, but NEVER trips the breaker.
+        Use DAILY_LOSS_LIMIT_PCT env var to control maximum daily drawdown.
+        """
+        # Track consecutive losses for informational logging (not a CB trigger)
         if pnl >= 0:
             self.consecutive_losses = 0
         else:
             self.consecutive_losses += 1
-
-        # Check consecutive loss limit
-        if self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
-            self.tripped = True
-            self.trip_reason = (
-                f"🔴 CIRCUIT BREAKER: {self.consecutive_losses} consecutive losses. "
-                f"Trading halted. Set CIRCUIT_BREAKER_RESET=true to resume."
+            log.info(
+                f"CB tracker: consecutive_losses={self.consecutive_losses} "
+                f"(informational — consecutive-loss trigger permanently disabled)"
             )
-            log.critical(self.trip_reason)
-            return
 
-        # Check daily drawdown limit
+        # 🔴 RISK: Daily drawdown — the ONLY remaining CB trigger.
+        # Uses real Binance balance, not state-file records. Cannot be faked.
         if self.daily_start_capital > 0:
             daily_dd = (self.daily_start_capital - capital) / self.daily_start_capital * 100
             if daily_dd >= DAILY_LOSS_LIMIT_PCT:
                 self.tripped = True
                 self.trip_reason = (
                     f"🔴 CIRCUIT BREAKER: Daily drawdown {daily_dd:.1f}% exceeds "
-                    f"{DAILY_LOSS_LIMIT_PCT}% limit. Trading halted."
+                    f"{DAILY_LOSS_LIMIT_PCT}% limit. Trading halted. "
+                    f"Set CIRCUIT_BREAKER_RESET=true to resume."
                 )
                 log.critical(self.trip_reason)
 
