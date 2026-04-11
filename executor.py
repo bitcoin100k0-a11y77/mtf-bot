@@ -544,9 +544,21 @@ class CircuitBreaker:
         self.trip_reason: str = ""
 
     def reset_daily(self, capital: float) -> None:
-        """Reset daily tracking at start of each UTC day."""
+        """Reset daily tracking at start of each UTC day.
+
+        🔴 FIX: If a trip was set on a previous UTC day (e.g. daily drawdown
+        from yesterday), auto-clear it on the new day.  Yesterday's drawdown
+        cannot exceed today's limit — only today's losses can apply today.
+        """
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if today != self.daily_start_date:
+            if self.tripped:
+                log.warning(
+                    f"CB: New UTC day ({today}) — auto-clearing previous day's trip.\n"
+                    f"Old reason: {self.trip_reason}"
+                )
+                self.tripped = False
+                self.trip_reason = ""
             self.daily_start_date = today
             self.daily_start_capital = capital
             log.info(f"Circuit breaker daily reset: start capital = ${capital:.2f}")
