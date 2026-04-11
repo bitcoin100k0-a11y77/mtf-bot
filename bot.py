@@ -164,37 +164,73 @@ def reconcile_open_trades(S: dict) -> None:
     📋 TEST THIS: Check Telegram startup message for "reconciled N stale trade(s)"
     when restarting with phantom state entries.
     """
+    import time as _time
+
     if not S.get("open_trades"):
         return
 
-    stale_symbols = []
+    MAX_RETRIES  = 3   # attempts per symbol before aggressive removal
+    RETRY_DELAY  = 2   # seconds between attempts
+
+    stale_symbols    = []
+    api_fail_symbols = []
+
     for sym in list(S["open_trades"].keys()):
-        try:
-            pos = executor.get_open_position(sym)
-            if pos is None or pos["qty"] <= 0:
+        last_exc  = None
+        confirmed = False
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                pos = executor.get_open_position(sym)
+                if pos is None or pos["qty"] <= 0:
+                    log.warning(
+                        f"RECONCILE: {sym} in open_trades but NO Binance position — "
+                        f"removing phantom trade (no P&L recorded)"
+                    )
+                    stale_symbols.append(sym)
+                else:
+                    log.info(
+                        f"RECONCILE: {sym} confirmed open on Binance — "
+                        f"side={pos['side']} qty={pos['qty']:.6f} "
+                        f"entry={pos['entry_price']:.4f}"
+                    )
+                confirmed = True
+                break  # success — stop retrying
+            except Exception as e:
+                last_exc = e
                 log.warning(
-                    f"RECONCILE: {sym} in open_trades but NO Binance position — "
-                    f"removing phantom trade (no P&L recorded)"
+                    f"RECONCILE: {sym} attempt {attempt}/{MAX_RETRIES} failed: {e}"
                 )
-                stale_symbols.append(sym)
-            else:
-                log.info(
-                    f"RECONCILE: {sym} confirmed open on Binance — "
-                    f"side={pos['side']} qty={pos['qty']:.6f} entry={pos['entry_price']:.4f}"
-                )
-        except Exception as e:
-            # If we can't check, leave the trade in place — safer than removing a real position
-            log.warning(f"RECONCILE: Could not verify {sym} position ({e}) — keeping in open_trades")
+                if attempt < MAX_RETRIES:
+                    _time.sleep(RETRY_DELAY)
+
+        if not confirmed:
+            # 🔴 FIX: All retries exhausted. Remove the trade anyway.
+            # Rationale: a phantom reaching check_exits() causes a fake consecutive
+            # loss that trips the CB. Server-side STOP_MARKET (closePosition=True)
+            # still guards capital on Binance even when we stop tracking here.
+            log.error(
+                f"RECONCILE: {sym} — unverifiable after {MAX_RETRIES} attempts "
+                f"(last: {last_exc}). Removing from tracking. "
+                f"Server-side SL remains active on Binance."
+            )
+            stale_symbols.append(sym)
+            api_fail_symbols.append(sym)
 
     for sym in stale_symbols:
         S["open_trades"].pop(sym, None)
 
     if stale_symbols:
+        api_note = ""
+        if api_fail_symbols:
+            api_note = (
+                f"\n⚠️ {len(api_fail_symbols)} removed due to API timeout (unverifiable): "
+                f"{', '.join(api_fail_symbols)}. Server-side SL still active."
+            )
         msg = (
             f"⚠️ Startup reconciliation removed {len(stale_symbols)} stale trade(s): "
             f"{', '.join(stale_symbols)}\n"
-            f"These had no matching Binance position. P&L NOT recorded. "
-            f"Circuit breaker NOT penalised."
+            f"P&L NOT recorded. Circuit breaker NOT penalised.{api_note}"
         )
         log.warning(msg)
         tg(msg)
