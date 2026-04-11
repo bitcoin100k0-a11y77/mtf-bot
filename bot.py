@@ -143,6 +143,65 @@ def rolling_mean(values, window):
 
 # ─── State ────────────────────────────────────────────────────────────────────
 
+def reconcile_open_trades(S: dict) -> None:
+    """Purge stale open_trades that have no matching Binance position on startup.
+
+    After a crash, restart, or manual intervention, bot_state.json may contain
+    trade records for positions that were already closed on Binance (e.g. by a
+    server-side SL while the bot was offline). If left in open_trades, these
+    phantom entries are evaluated by check_exits() on the first check cycle, and
+    their SL prices may already be exceeded — causing up to N consecutive phantom
+    losses that trip the circuit breaker before any real trade is placed.
+
+    This function queries Binance for each open_trade symbol and removes entries
+    that have no real position. It does NOT record P&L or feed the circuit breaker
+    — the trade outcome is unknown (SL may or may not have filled at exactly SL px).
+
+    🔴 RISK: Calling this at startup means any real position opened by the bot
+    that is still active on Binance is preserved. Only truly closed positions are
+    removed. Call AFTER _get_exchange() has been verified to work.
+
+    📋 TEST THIS: Check Telegram startup message for "reconciled N stale trade(s)"
+    when restarting with phantom state entries.
+    """
+    if not S.get("open_trades"):
+        return
+
+    stale_symbols = []
+    for sym in list(S["open_trades"].keys()):
+        try:
+            pos = executor.get_open_position(sym)
+            if pos is None or pos["qty"] <= 0:
+                log.warning(
+                    f"RECONCILE: {sym} in open_trades but NO Binance position — "
+                    f"removing phantom trade (no P&L recorded)"
+                )
+                stale_symbols.append(sym)
+            else:
+                log.info(
+                    f"RECONCILE: {sym} confirmed open on Binance — "
+                    f"side={pos['side']} qty={pos['qty']:.6f} entry={pos['entry_price']:.4f}"
+                )
+        except Exception as e:
+            # If we can't check, leave the trade in place — safer than removing a real position
+            log.warning(f"RECONCILE: Could not verify {sym} position ({e}) — keeping in open_trades")
+
+    for sym in stale_symbols:
+        S["open_trades"].pop(sym, None)
+
+    if stale_symbols:
+        msg = (
+            f"⚠️ Startup reconciliation removed {len(stale_symbols)} stale trade(s): "
+            f"{', '.join(stale_symbols)}\n"
+            f"These had no matching Binance position. P&L NOT recorded. "
+            f"Circuit breaker NOT penalised."
+        )
+        log.warning(msg)
+        tg(msg)
+    else:
+        log.info("RECONCILE: All open_trades verified against Binance — no stale entries")
+
+
 def fresh_state():
     """Create a fresh bot state dictionary."""
     return {
@@ -746,8 +805,24 @@ def main():
                 else:
                     S["peak"] = max(S.get("peak", bal), bal)
                 log.info(f"Capital synced from Binance: ${bal:.2f} | peak=${S['peak']:.2f} | start=${S['start_capital']:.2f}")
-                # 🔴 RISK: Reset CB baseline NOW with real capital, not stale IC
-                executor.circuit_breaker.reset_daily(bal)
+
+                # 🔴 FIX: Force CB daily baseline to real current balance on EVERY startup.
+                # reset_daily() is date-gated — it won't update daily_start_capital if the
+                # date hasn't changed. This means after a CB manual reset + same-day restart,
+                # daily_start_capital remains stale (e.g. $114 pre-loss), and the drawdown
+                # check re-trips the breaker immediately. Forcing it here prevents that.
+                executor.circuit_breaker.daily_start_capital = bal
+                executor.circuit_breaker.daily_start_date = (
+                    datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                )
+                log.info(f"CB daily baseline forced to real balance: ${bal:.2f}")
+
+            # 🔴 FIX: Reconcile open_trades against actual Binance positions.
+            # Phantom trade entries (positions closed by server-side SL while bot
+            # was offline) cause consecutive phantom losses on first check cycle,
+            # tripping the circuit breaker before any real trade executes.
+            reconcile_open_trades(S)
+
     except Exception as e:
         log.error(f"Exchange init failed: {e}")
         tg(f"\u274c Exchange init failed: {e}\nBot will retry on first trade.")
