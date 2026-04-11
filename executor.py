@@ -42,7 +42,7 @@ try:
 except Exception as _e:
     log.warning(f"Could not fetch/send public IP: {_e}")
 DAILY_LOSS_LIMIT_PCT = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "5.0"))  # 🔴 RISK: halt after 5% daily DD
-MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))   # 🔴 RISK: halt after 3 losses in a row
+MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "6"))   # 🔴 RISK: halt after 6 losses in a row (raised from 3 — 3 was too tight for 3-pair live bot)
 LEVERAGE = int(os.getenv("FUTURES_LEVERAGE", "1"))  # 🔴 RISK: default 1x, no leverage
 
 
