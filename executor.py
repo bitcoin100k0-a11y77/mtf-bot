@@ -237,6 +237,40 @@ def open_position(
     ex = _get_exchange()
     _init_leverage(symbol)
 
+    # 🔴 FIX (-2019 Margin insufficient): pre-flight margin check.
+    # Strategy sizing (capital × RISK_PCT) / (atr × SL_MULT) caps loss-if-SL-hits
+    # but has ZERO coupling to available margin. On small accounts (~$100) with
+    # BTC ~$100k at FUTURES_LEVERAGE=1, notional can easily exceed balance and
+    # Binance rejects the order with -2019. Check before spending API budget.
+    # Buffer: 5% headroom for slippage between signal price and market fill,
+    # plus ~0.04% taker fee on entry + ~0.04% on eventual exit.
+    try:
+        notional = qty * float(entry_price)
+        leverage = max(LEVERAGE, 1)
+        required_margin = notional / leverage
+        available = get_futures_balance()
+        # 5% headroom — covers fee (~0.08% round-trip) + slippage + Binance's
+        # internal initial-margin ratio quirks on certain symbols.
+        margin_buffer = 0.95
+        if required_margin > available * margin_buffer:
+            result["error"] = (
+                f"Insufficient margin (pre-flight): need ~${required_margin:.2f} "
+                f"(notional ${notional:.2f} / {leverage}x), have ${available:.2f} "
+                f"— skipping {direction} {symbol}. "
+                f"Fix: increase FUTURES_LEVERAGE, reduce RISK_PCT, or fund wallet."
+            )
+            log.warning(result["error"])
+            return result
+        log.info(
+            f"Margin OK: need ${required_margin:.2f} / have ${available:.2f} "
+            f"(notional ${notional:.2f} @ {leverage}x)"
+        )
+    except Exception as _mc_err:
+        # Margin check is advisory — if it fails (e.g. balance API hiccup),
+        # fall through to the actual order; Binance will still reject with -2019
+        # if truly under-margined and the caller will see that error.
+        log.warning(f"Pre-flight margin check skipped ({_mc_err}) — proceeding with order")
+
     # 1) Market entry order
     try:
         log.info(f"PLACING {direction} {qty} {ccxt_sym} MARKET")
@@ -441,20 +475,63 @@ def close_full_position(symbol: str, direction: str) -> dict:
 def cancel_open_orders(symbol: str) -> bool:
     """Cancel all open orders for a symbol (used before closing position).
 
+    🔴 FIX (-4130 race): atomic server-side cancellation + verification loop.
+    Prior iterate-and-cancel + sleep(0.3) caused two failure modes:
+      (a) Silent per-order cancel failure → old SL survives → -4130 on replace.
+      (b) Binance's "existing closePosition in direction" tracker had up to ~1s
+          propagation lag, losing the race against sleep(0.3).
+    Now: one DELETE /fapi/v1/allOpenOrders call, then poll until open_orders is
+    empty (max ~1.5s). If polling still shows orders, log CRITICAL so BE moves
+    can see a truthful signal and back off instead of blindly placing.
+
     Returns:
-        bool: True if cancelled successfully or no orders to cancel.
+        bool: True if open_orders is confirmed empty, False otherwise.
     """
     try:
         ex = _get_exchange()
         ccxt_sym = _symbol_to_ccxt(symbol)
-        open_orders = ex.fetch_open_orders(ccxt_sym)
-        for order in open_orders:
+
+        # 1) Atomic server-side cancel — single request, no per-order silent fails.
+        try:
+            ex.cancel_all_orders(ccxt_sym)
+            log.info(f"cancel_all_orders sent for {symbol}")
+        except Exception as e:
+            # Fall back to iterate-and-cancel if the atomic endpoint misbehaves.
+            log.warning(f"cancel_all_orders failed for {symbol}: {e} — falling back to iterate")
             try:
-                ex.cancel_order(order["id"], ccxt_sym)
-                log.info(f"Cancelled order {order['id']} for {symbol}")
-            except Exception as e:
-                log.warning(f"Failed to cancel order {order['id']}: {e}")
-        return True
+                for order in ex.fetch_open_orders(ccxt_sym):
+                    try:
+                        ex.cancel_order(order["id"], ccxt_sym)
+                        log.info(f"Cancelled order {order['id']} for {symbol}")
+                    except Exception as ce:
+                        log.warning(f"Failed to cancel order {order['id']}: {ce}")
+            except Exception as fe:
+                log.error(f"Iterate-cancel fallback also failed for {symbol}: {fe}")
+                return False
+
+        # 2) Verify — poll until open_orders truly empty or timeout (~1.5s).
+        # Binance's internal tracker that powers -4130 checks takes time to settle.
+        deadline = time.time() + 1.5
+        while time.time() < deadline:
+            try:
+                remaining = ex.fetch_open_orders(ccxt_sym)
+            except Exception as pe:
+                log.warning(f"Post-cancel poll failed for {symbol}: {pe}")
+                remaining = None
+            if remaining == []:
+                log.info(f"Cancel verified: 0 open orders remain for {symbol}")
+                return True
+            time.sleep(0.2)
+
+        # Fell through — something is still pending. Caller must decide.
+        try:
+            still = ex.fetch_open_orders(ccxt_sym)
+            log.warning(
+                f"Cancel verification timeout for {symbol}: {len(still)} order(s) still open"
+            )
+        except Exception:
+            log.warning(f"Cancel verification timeout for {symbol}: poll unavailable")
+        return False
     except Exception as e:
         log.error(f"Failed to fetch/cancel orders for {symbol}: {e}")
         return False
@@ -489,25 +566,62 @@ def move_stop_loss(
     try:
         ex = _get_exchange()
 
-        # Cancel existing SL orders first
-        cancel_open_orders(symbol)
-        time.sleep(0.3)  # brief pause after cancellation
+        # 🔴 FIX (-4130): Use verifying cancel + retry loop instead of cancel+sleep.
+        # Binance rejects a new closePosition STOP_MARKET with -4130 if another
+        # closePosition SL in the same direction is still registered internally.
+        # That tracker lags actual open-orders state by up to ~1s, so we must:
+        #   1) cancel atomically (cancel_open_orders now uses cancel_all_orders)
+        #   2) verify cancellation via polling
+        #   3) on -4130 despite verification, back off and retry up to 3x
+        last_err: Optional[Exception] = None
+        for attempt in range(1, 4):
+            cancelled_clean = cancel_open_orders(symbol)
+            if not cancelled_clean:
+                # Cancel verification did not go clean — extra breath before we try
+                log.warning(
+                    f"{symbol} SL move attempt {attempt}/3: cancel not verified clean, "
+                    f"waiting 1.0s before placing new SL"
+                )
+                time.sleep(1.0)
 
-        # Place new SL
-        log.info(f"NEW SL: {sl_side} closePosition {ccxt_sym} @ {sl_px}")
-        sl_order = ex.create_order(
-            symbol=ccxt_sym,
-            type="stop_market",
-            side=sl_side,
-            amount=qty,          # ignored by Binance when closePosition=True
-            params={
-                "stopPrice": sl_px,
-                "closePosition": True,  # 🔴 FIX: avoids -4120; closes full remaining position
-                # reduceOnly=True with STOP_MARKET now requires Algo Order endpoint (-4120)
-            },
-        )
-        result.update({"success": True, "sl_order_id": sl_order.get("id", "unknown")})
-        log.info(f"SL moved to {sl_px} (order: {result['sl_order_id']})")
+            try:
+                log.info(
+                    f"NEW SL (attempt {attempt}/3): {sl_side} closePosition "
+                    f"{ccxt_sym} @ {sl_px}"
+                )
+                sl_order = ex.create_order(
+                    symbol=ccxt_sym,
+                    type="stop_market",
+                    side=sl_side,
+                    amount=qty,          # ignored by Binance when closePosition=True
+                    params={
+                        "stopPrice": sl_px,
+                        "closePosition": True,  # avoids -4120; closes full remaining position
+                    },
+                )
+                result.update({"success": True, "sl_order_id": sl_order.get("id", "unknown")})
+                log.info(f"SL moved to {sl_px} (order: {result['sl_order_id']})")
+                return result
+            except Exception as e:
+                last_err = e
+                err_str = str(e)
+                # -4130 = "open stop or TP with GTE and closePosition in direction exists"
+                # This is the exact race we're fighting — worth retrying with back-off.
+                if "-4130" in err_str and attempt < 3:
+                    backoff = 1.0 * attempt  # 1s, 2s
+                    log.warning(
+                        f"{symbol} SL move hit -4130 on attempt {attempt} — "
+                        f"existing closePosition SL still registered. "
+                        f"Backing off {backoff:.1f}s and retrying."
+                    )
+                    time.sleep(backoff)
+                    continue
+                # Non-retryable error, or retries exhausted
+                break
+
+        # All attempts failed
+        result["error"] = f"SL move failed: {last_err}"
+        log.error(result["error"])
     except Exception as e:
         result["error"] = f"SL move failed: {e}"
         log.error(result["error"])
