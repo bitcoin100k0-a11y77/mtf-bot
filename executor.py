@@ -827,6 +827,17 @@ def _place_reduceonly_sl_with_retry(
         except Exception as e:
             last_err = e
             err_str = str(e)
+            # qty below Binance minimum lot — non-retryable; fall back to closePosition
+            # which ignores qty entirely and closes whatever position exists.
+            if "minimum amount" in err_str.lower():
+                log.warning(
+                    f"{symbol} reduceOnly qty {qty} below exchange minimum — "
+                    f"falling back to closePosition (ignores qty)"
+                )
+                return _place_closeposition_sl_with_retry(
+                    symbol=symbol, sl_side=sl_side,
+                    stop_price=stop_price, qty=qty,
+                )
             is_4130 = "4130" in err_str
             if is_4130 and attempt < max_attempts:
                 backoff = max(2.5, 2.0 * attempt)
@@ -886,14 +897,37 @@ def move_stop_loss(
     # closePosition duplicate-tracker race. Entry SL still uses closePosition in
     # open_position (no prior tracker state = no race). Pre-check inside the helper
     # short-circuits if server already has the target SL (idempotent restarts).
+    #
+    # qty==0 guard: after TP partials, remaining_qty can round down below the
+    # Binance minimum lot (e.g. 0.001 ETH). reduceOnly requires valid qty — fall
+    # back to closePosition which ignores qty and always works regardless of size.
+    min_lot = 0.0
     try:
-        sl_result = _place_reduceonly_sl_with_retry(
-            symbol=symbol,
-            sl_side=sl_side,
-            stop_price=sl_px,
-            qty=qty,
-            max_attempts=5,
+        min_lot = float(
+            _get_exchange().market(ccxt_sym).get("limits", {}).get("amount", {}).get("min") or 0.0
         )
+    except Exception:
+        pass
+    use_closeposition_fallback = qty <= 0 or (min_lot > 0 and qty < min_lot)
+    if use_closeposition_fallback:
+        log.warning(
+            f"{symbol} qty={qty} below min_lot={min_lot} — using closePosition (ignores qty)"
+        )
+
+    try:
+        if use_closeposition_fallback:
+            sl_result = _place_closeposition_sl_with_retry(
+                symbol=symbol, sl_side=sl_side,
+                stop_price=sl_px, qty=max(qty, remaining_qty),
+            )
+        else:
+            sl_result = _place_reduceonly_sl_with_retry(
+                symbol=symbol,
+                sl_side=sl_side,
+                stop_price=sl_px,
+                qty=qty,
+                max_attempts=5,
+            )
         result["success"]     = sl_result["success"]
         result["sl_order_id"] = sl_result["sl_order_id"]
         result["error"]       = sl_result["error"]
