@@ -249,9 +249,10 @@ def open_position(
         leverage = max(LEVERAGE, 1)
         required_margin = notional / leverage
         available = get_futures_balance()
-        # 5% headroom — covers fee (~0.08% round-trip) + slippage + Binance's
-        # internal initial-margin ratio quirks on certain symbols.
-        margin_buffer = 0.95
+        # 🔴 FIX (-2019): 10% headroom — covers taker fees (~0.08% round-trip),
+        # slippage on market fills (1-2% on 5m bar range for volatile pairs),
+        # and Binance's per-symbol initial-margin-ratio quirks on small accounts.
+        margin_buffer = 0.90
         if required_margin > available * margin_buffer:
             result["error"] = (
                 f"Insufficient margin (pre-flight): need ~${required_margin:.2f} "
@@ -293,28 +294,28 @@ def open_position(
         log.error(result["error"])
         return result
 
-    # 2) Server-side stop-loss (stop-market order)
-    try:
-        log.info(f"PLACING SL {sl_side} closePosition {ccxt_sym} @ {sl_px}")
-        sl_order = ex.create_order(
-            symbol=ccxt_sym,
-            type="stop_market",  # Binance Futures stop-market
-            side=sl_side,
-            amount=fill_qty,     # ignored by Binance when closePosition=True
-            params={
-                "stopPrice": sl_px,
-                "closePosition": True,  # 🔴 FIX: avoids -4120; closes full remaining position
-                # reduceOnly=True with STOP_MARKET now requires Algo Order endpoint (-4120)
-                # closePosition=True uses standard /fapi/v1/order and is semantically correct
-            },
+    # 2) Server-side stop-loss via retry helper
+    # 🔴 FIX (-4130): raw create_order was attempted once; if a stale SL from a
+    # prior crash existed on Binance, it hit -4130 and left the entry naked.
+    # The helper cancels first, waits for Binance's internal tracker to settle,
+    # then retries up to 3 times on -4130 with exponential backoff.
+    sl_result = _place_closeposition_sl_with_retry(
+        symbol=symbol,
+        sl_side=sl_side,
+        stop_price=sl_px,
+        qty=fill_qty,
+        max_attempts=3,
+    )
+    if sl_result["success"]:
+        result["sl_order_id"] = sl_result["sl_order_id"]
+    else:
+        # 🔴 RISK: Entry filled but SL still failed after 3 attempts — critical.
+        log.error(f"CRITICAL: SL placement failed after retries! {sl_result['error']}")
+        log.error(
+            f"MANUAL ACTION REQUIRED: Place SL for {direction} {fill_qty} "
+            f"{symbol} at {sl_px}"
         )
-        result["sl_order_id"] = sl_order.get("id", "unknown")
-        log.info(f"SL placed: {result['sl_order_id']} @ {sl_px}")
-    except Exception as e:
-        # 🔴 RISK: Entry filled but SL failed — critical situation
-        log.error(f"CRITICAL: SL order failed after entry fill! {e}")
-        log.error(f"MANUAL ACTION REQUIRED: Place SL for {direction} {fill_qty} {symbol} at {sl_px}")
-        result["error"] = f"SL placement failed (entry is open!): {e}"
+        result["error"] = f"SL placement failed (entry is open!): {sl_result['error']}"
         # Don't return failure — entry IS open, caller must handle
 
     return result
@@ -438,19 +439,22 @@ def close_full_position(symbol: str, direction: str) -> dict:
             else:
                 stop_px = _round_price(ccxt_sym, cur_px * 1.005)
 
+            # 🔴 FIX (-4130): dust close uses closePosition=True — same race as any SL.
+            # Must cancel existing SL first; then place with retry via the shared helper.
             log.info(f"DUST CLOSE: {close_side} closePosition {ccxt_sym} @ stop={stop_px} (cur={cur_px:.4f})")
-            dust_order = ex.create_order(
-                symbol=ccxt_sym,
-                type="stop_market",
-                side=close_side,
-                amount=pos["qty"],   # ignored by Binance when closePosition=True
-                params={
-                    "stopPrice": stop_px,
-                    "closePosition": True,  # closes full remaining position, bypasses qty minimum
-                },
+            dust_result = _place_closeposition_sl_with_retry(
+                symbol=symbol,
+                sl_side=close_side,
+                stop_price=stop_px,
+                qty=pos["qty"],
+                max_attempts=3,
             )
-            log.info(f"DUST CLOSE order placed: {dust_order.get('id', 'unknown')} @ stop={stop_px}")
-            result.update({"success": True, "fill_price": cur_px})
+            if dust_result["success"]:
+                log.info(f"DUST CLOSE placed: {dust_result['sl_order_id']} @ stop={stop_px}")
+                result.update({"success": True, "fill_price": cur_px})
+            else:
+                log.error(f"DUST CLOSE failed: {dust_result['error']}")
+                result["error"] = dust_result["error"]
             return result
 
         # ── Normal close — position is above minimum lot size ────────────────
@@ -537,6 +541,92 @@ def cancel_open_orders(symbol: str) -> bool:
         return False
 
 
+def _place_closeposition_sl_with_retry(
+    symbol: str,
+    sl_side: str,          # "sell" (close LONG) or "buy" (close SHORT)
+    stop_price: float,     # already-rounded stop price
+    qty: float,            # ignored by Binance when closePosition=True, but CCXT requires a value
+    max_attempts: int = 3,
+    min_wait_after_cancel: float = 0.8,
+) -> dict:
+    """Single source of truth for placing a closePosition STOP_MARKET on Binance Futures.
+
+    Cancel → guaranteed-wait → place, with retry on -4130.
+
+    🔴 FIX (-4130 race): Binance's internal "existing closePosition in direction"
+    tracker lags the open-orders list by up to ~1 second. A verified-empty cancel
+    is NOT sufficient guarantee — we must always sleep min_wait_after_cancel before
+    placing the new order, regardless of whether cancel verified clean.
+
+    Error-string matching is deliberately broad: Binance returns -4130 in various
+    formats across API versions (e.g. "-4130", '"code":-4130', "code:-4130").
+
+    Returns:
+        dict: {"success": bool, "sl_order_id": str|None, "error": str|None}
+    """
+    ccxt_sym = _symbol_to_ccxt(symbol)
+    ex = _get_exchange()
+    result: dict = {"success": False, "sl_order_id": None, "error": None}
+    last_err: Optional[Exception] = None
+
+    for attempt in range(1, max_attempts + 1):
+        cancelled_clean = cancel_open_orders(symbol)
+        # ALWAYS wait — even when cancel verified clean.
+        # verified-empty open-orders ≠ safe-to-place (Binance's -4130 tracker lags).
+        wait = min_wait_after_cancel if cancelled_clean else max(min_wait_after_cancel, 1.2)
+        log.info(
+            f"{symbol} SL place attempt {attempt}/{max_attempts}: "
+            f"cancelled_clean={cancelled_clean}, waiting {wait:.2f}s before placing"
+        )
+        time.sleep(wait)
+
+        try:
+            log.info(
+                f"PLACING SL (attempt {attempt}/{max_attempts}): "
+                f"{sl_side} closePosition {ccxt_sym} @ {stop_price}"
+            )
+            sl_order = ex.create_order(
+                symbol=ccxt_sym,
+                type="stop_market",
+                side=sl_side,
+                amount=qty,
+                params={
+                    "stopPrice": stop_price,
+                    "closePosition": True,
+                },
+            )
+            result.update({
+                "success": True,
+                "sl_order_id": sl_order.get("id", "unknown"),
+                "error": None,
+            })
+            log.info(f"SL placed: {result['sl_order_id']} @ {stop_price}")
+            return result
+
+        except Exception as e:
+            last_err = e
+            err_str = str(e)
+            # Robust -4130 detection: match the numeric token regardless of surrounding format.
+            is_4130 = "4130" in err_str
+            if is_4130 and attempt < max_attempts:
+                backoff = 1.5 * attempt  # 1.5 s, then 3.0 s
+                log.warning(
+                    f"{symbol} SL placement hit -4130 on attempt {attempt} — "
+                    f"existing closePosition SL still registered server-side. "
+                    f"Backing off {backoff:.1f}s and retrying."
+                )
+                time.sleep(backoff)
+                continue
+            # Non-retryable error, or all retries exhausted
+            log.error(
+                f"{symbol} SL placement failed (attempt {attempt}/{max_attempts}): {e}"
+            )
+            break
+
+    result["error"] = f"SL placement failed after {max_attempts} attempt(s): {last_err}"
+    return result
+
+
 def move_stop_loss(
     symbol: str,
     direction: str,
@@ -563,67 +653,26 @@ def move_stop_loss(
 
     result = {"success": False, "sl_order_id": None, "error": None}
 
+    # 🔴 FIX (-4130): Delegate to the shared helper which enforces
+    # cancel → guaranteed-wait → place with -4130 retry and exponential backoff.
+    # The old inline retry loop is replaced here to keep the pattern in one place.
     try:
-        ex = _get_exchange()
-
-        # 🔴 FIX (-4130): Use verifying cancel + retry loop instead of cancel+sleep.
-        # Binance rejects a new closePosition STOP_MARKET with -4130 if another
-        # closePosition SL in the same direction is still registered internally.
-        # That tracker lags actual open-orders state by up to ~1s, so we must:
-        #   1) cancel atomically (cancel_open_orders now uses cancel_all_orders)
-        #   2) verify cancellation via polling
-        #   3) on -4130 despite verification, back off and retry up to 3x
-        last_err: Optional[Exception] = None
-        for attempt in range(1, 4):
-            cancelled_clean = cancel_open_orders(symbol)
-            if not cancelled_clean:
-                # Cancel verification did not go clean — extra breath before we try
-                log.warning(
-                    f"{symbol} SL move attempt {attempt}/3: cancel not verified clean, "
-                    f"waiting 1.0s before placing new SL"
-                )
-                time.sleep(1.0)
-
-            try:
-                log.info(
-                    f"NEW SL (attempt {attempt}/3): {sl_side} closePosition "
-                    f"{ccxt_sym} @ {sl_px}"
-                )
-                sl_order = ex.create_order(
-                    symbol=ccxt_sym,
-                    type="stop_market",
-                    side=sl_side,
-                    amount=qty,          # ignored by Binance when closePosition=True
-                    params={
-                        "stopPrice": sl_px,
-                        "closePosition": True,  # avoids -4120; closes full remaining position
-                    },
-                )
-                result.update({"success": True, "sl_order_id": sl_order.get("id", "unknown")})
-                log.info(f"SL moved to {sl_px} (order: {result['sl_order_id']})")
-                return result
-            except Exception as e:
-                last_err = e
-                err_str = str(e)
-                # -4130 = "open stop or TP with GTE and closePosition in direction exists"
-                # This is the exact race we're fighting — worth retrying with back-off.
-                if "-4130" in err_str and attempt < 3:
-                    backoff = 1.0 * attempt  # 1s, 2s
-                    log.warning(
-                        f"{symbol} SL move hit -4130 on attempt {attempt} — "
-                        f"existing closePosition SL still registered. "
-                        f"Backing off {backoff:.1f}s and retrying."
-                    )
-                    time.sleep(backoff)
-                    continue
-                # Non-retryable error, or retries exhausted
-                break
-
-        # All attempts failed
-        result["error"] = f"SL move failed: {last_err}"
-        log.error(result["error"])
+        sl_result = _place_closeposition_sl_with_retry(
+            symbol=symbol,
+            sl_side=sl_side,
+            stop_price=sl_px,
+            qty=qty,
+            max_attempts=3,
+        )
+        result["success"]     = sl_result["success"]
+        result["sl_order_id"] = sl_result["sl_order_id"]
+        result["error"]       = sl_result["error"]
+        if sl_result["success"]:
+            log.info(f"SL moved to {sl_px} (order: {sl_result['sl_order_id']})")
+        else:
+            log.error(f"SL move failed: {sl_result['error']}")
     except Exception as e:
-        result["error"] = f"SL move failed: {e}"
+        result["error"] = f"SL move failed (unexpected): {e}"
         log.error(result["error"])
 
     return result
