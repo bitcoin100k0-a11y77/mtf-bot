@@ -238,6 +238,56 @@ def reconcile_open_trades(S: dict) -> None:
         log.info("RECONCILE: All open_trades verified against Binance — no stale entries")
 
 
+def cleanup_orphan_sl_orders(S: dict) -> None:
+    """Cancel and re-place a fresh SL for every still-tracked open_trade at startup.
+
+    🔴 FIX (-4130 race on restart): After any crash/restart, server-side SL orders
+    may linger on Binance while the bot's internal state has drifted (be_hit flag
+    reset, capital re-synced, etc.). On the next BE trigger or TP partial close,
+    move_stop_loss() tries to replace the SL — but the old one is still registered
+    in Binance's internal -4130 tracker and the placement fails.
+
+    By proactively cancelling and re-placing the SL for every open_trade at startup
+    we guarantee a clean slate. executor.move_stop_loss() uses _place_closeposition_sl_with_retry()
+    internally, so the helper's cancel → wait → retry defence applies here too.
+
+    Call AFTER reconcile_open_trades() so we only process real (non-phantom) positions.
+    """
+    if not S.get("open_trades"):
+        log.info("Orphan SL cleanup: no open trades to sweep")
+        return
+
+    for sym, ot in list(S["open_trades"].items()):
+        try:
+            direction    = ot["dir"]
+            remaining_qty = ot["size"] * ot.get("rem", 1.0)
+            sl_price     = ot["sl"]
+            log.info(
+                f"Orphan SL cleanup: refreshing SL for {sym} "
+                f"({direction} qty={remaining_qty:.6f} sl={sl_price})"
+            )
+            # move_stop_loss → _place_closeposition_sl_with_retry (cancel + wait + retry)
+            result = executor.move_stop_loss(
+                symbol=sym,
+                direction=direction,
+                new_sl_price=sl_price,
+                remaining_qty=remaining_qty,
+            )
+            if result["success"]:
+                ot["exec_sl_id"] = result["sl_order_id"]
+                log.info(f"Orphan SL cleanup: {sym} fresh SL placed ({result['sl_order_id']})")
+                tg(f"\U0001f6e1 <b>{sym}</b> startup SL refreshed @ {sl_price}")
+            else:
+                log.warning(
+                    f"Orphan SL cleanup: {sym} failed to refresh SL "
+                    f"({result['error']}) — next trigger will retry via helper"
+                )
+        except Exception as e:
+            log.error(f"Orphan SL cleanup: {sym} unexpected error: {e}")
+
+    log.info("Orphan SL cleanup: complete")
+
+
 def fresh_state():
     """Create a fresh bot state dictionary."""
     return {
@@ -893,6 +943,7 @@ def main():
             # was offline) cause consecutive phantom losses on first check cycle,
             # tripping the circuit breaker before any real trade executes.
             reconcile_open_trades(S)
+            cleanup_orphan_sl_orders(S)  # 🔴 FIX: cancel stale SLs + re-place fresh ones
 
     except Exception as e:
         log.error(f"Exchange init failed: {e}")
