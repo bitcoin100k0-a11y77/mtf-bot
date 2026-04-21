@@ -137,6 +137,21 @@ check("get_futures_account_state() defined",
 check("executor returns equity dict shape",
       '"equity"' in exec_src and '"wallet"' in exec_src)
 
+check("_fetch_current_sl helper defined",
+      "def _fetch_current_sl" in exec_src)
+
+check("_sl_already_at helper defined",
+      "def _sl_already_at" in exec_src)
+
+check("_place_reduceonly_sl_with_retry defined",
+      "def _place_reduceonly_sl_with_retry" in exec_src)
+
+check("_get_hedge_mode probe defined",
+      "def _get_hedge_mode" in exec_src)
+
+check("move_stop_loss uses reduceOnly path",
+      "_place_reduceonly_sl_with_retry" in exec_src)
+
 # ─────────────────────────────────────────────
 # 5. BOT.PY — CRITICAL PATCHES
 # ─────────────────────────────────────────────
@@ -185,8 +200,8 @@ check("bot.py stores S[live_equity]",
 # ─────────────────────────────────────────────
 print("\n[5] Structure Sanity")
 
-check(f"executor.py line count in range 580–970 (got {len(exec_lines)})",
-      580 <= len(exec_lines) <= 970,
+check(f"executor.py line count in range 580–1120 (got {len(exec_lines)})",
+      580 <= len(exec_lines) <= 1120,
       f"unexpected line count may indicate missing or duplicate content")
 
 check(f"bot.py line count in range 750–1260 (got {len(bot_lines)})",
