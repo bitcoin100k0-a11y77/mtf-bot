@@ -89,6 +89,41 @@ def _get_exchange():
     return _exchange
 
 
+# ─── Hedge-mode probe ────────────────────────────────────────────────────────
+
+_HEDGE_MODE: Optional[bool] = None
+
+
+def _get_hedge_mode() -> bool:
+    """Detect whether the Futures account runs in Hedge Mode (dualSidePosition).
+
+    Cached after first successful probe. Defaults to False on probe failure so
+    that orders placed without positionSide continue to work for one-way accounts.
+    """
+    global _HEDGE_MODE
+    if _HEDGE_MODE is None:
+        try:
+            ex = _get_exchange()
+            probe = getattr(ex, "fapiPrivateGetPositionSideDual", None)
+            if probe:
+                resp = probe()
+                _HEDGE_MODE = bool(resp.get("dualSidePosition", False))
+            else:
+                _HEDGE_MODE = False
+            log.info(f"Hedge mode detected: {_HEDGE_MODE}")
+        except Exception as e:
+            log.warning(f"Hedge mode probe failed ({e}); assuming one-way")
+            _HEDGE_MODE = False
+    return _HEDGE_MODE
+
+
+def _position_side_for(direction: str) -> Optional[str]:
+    """Return 'LONG'/'SHORT' if hedge mode; None for one-way."""
+    if not _get_hedge_mode():
+        return None
+    return "LONG" if direction == "LONG" else "SHORT"
+
+
 def _init_leverage(symbol: str) -> None:
     """Set leverage for a symbol. Called once per symbol on first trade."""
     ex = _get_exchange()
@@ -584,13 +619,51 @@ def cancel_open_orders(symbol: str) -> bool:
         return False
 
 
+def _fetch_current_sl(symbol: str, sl_side: str) -> Optional[dict]:
+    """Return the currently-active STOP_MARKET on symbol matching sl_side, or None.
+
+    Used for idempotency pre-check before placing a new SL: if server already has
+    the desired SL, we skip cancel+place entirely and avoid the -4130 race.
+    """
+    try:
+        ex = _get_exchange()
+        ccxt_sym = _symbol_to_ccxt(symbol)
+        for o in ex.fetch_open_orders(ccxt_sym):
+            info = o.get("info", {}) or {}
+            o_type = (info.get("type") or o.get("type") or "").upper()
+            o_side = (info.get("side") or o.get("side") or "").lower()
+            if "STOP" in o_type and o_side == sl_side.lower():
+                return o
+        return None
+    except Exception as e:
+        log.warning(f"fetch_current_sl failed for {symbol}: {e}")
+        return None
+
+
+def _sl_already_at(symbol: str, sl_side: str, target_px: float, tol_pct: float = 0.1) -> Optional[str]:
+    """If an SL is already present at target_px (±tol_pct %), return its id; else None."""
+    existing = _fetch_current_sl(symbol, sl_side)
+    if not existing:
+        return None
+    info = existing.get("info", {}) or {}
+    try:
+        cur = float(info.get("stopPrice") or existing.get("stopPrice") or 0) or 0.0
+    except (TypeError, ValueError):
+        return None
+    if cur <= 0 or target_px <= 0:
+        return None
+    if abs(cur - target_px) / target_px * 100 <= tol_pct:
+        return existing.get("id")
+    return None
+
+
 def _place_closeposition_sl_with_retry(
     symbol: str,
     sl_side: str,          # "sell" (close LONG) or "buy" (close SHORT)
     stop_price: float,     # already-rounded stop price
     qty: float,            # ignored by Binance when closePosition=True, but CCXT requires a value
-    max_attempts: int = 3,
-    min_wait_after_cancel: float = 0.8,
+    max_attempts: int = 5,
+    min_wait_after_cancel: float = 1.5,
 ) -> dict:
     """Single source of truth for placing a closePosition STOP_MARKET on Binance Futures.
 
@@ -612,11 +685,19 @@ def _place_closeposition_sl_with_retry(
     result: dict = {"success": False, "sl_order_id": None, "error": None}
     last_err: Optional[Exception] = None
 
+    # Idempotency pre-check: if an SL already sits at the target price, skip cancel+place.
+    existing_id = _sl_already_at(symbol, sl_side, stop_price)
+    if existing_id:
+        log.info(
+            f"{symbol} SL already at target {stop_price} — skipping replace (id={existing_id})"
+        )
+        return {"success": True, "sl_order_id": existing_id, "error": None}
+
     for attempt in range(1, max_attempts + 1):
         cancelled_clean = cancel_open_orders(symbol)
         # ALWAYS wait — even when cancel verified clean.
         # verified-empty open-orders ≠ safe-to-place (Binance's -4130 tracker lags).
-        wait = min_wait_after_cancel if cancelled_clean else max(min_wait_after_cancel, 1.2)
+        wait = min_wait_after_cancel if cancelled_clean else max(min_wait_after_cancel, 2.0)
         log.info(
             f"{symbol} SL place attempt {attempt}/{max_attempts}: "
             f"cancelled_clean={cancelled_clean}, waiting {wait:.2f}s before placing"
@@ -624,6 +705,10 @@ def _place_closeposition_sl_with_retry(
         time.sleep(wait)
 
         try:
+            params = {"stopPrice": stop_price, "closePosition": True}
+            ps = _position_side_for("LONG" if sl_side == "sell" else "SHORT")
+            if ps:
+                params["positionSide"] = ps
             log.info(
                 f"PLACING SL (attempt {attempt}/{max_attempts}): "
                 f"{sl_side} closePosition {ccxt_sym} @ {stop_price}"
@@ -633,10 +718,7 @@ def _place_closeposition_sl_with_retry(
                 type="stop_market",
                 side=sl_side,
                 amount=qty,
-                params={
-                    "stopPrice": stop_price,
-                    "closePosition": True,
-                },
+                params=params,
             )
             result.update({
                 "success": True,
@@ -652,7 +734,7 @@ def _place_closeposition_sl_with_retry(
             # Robust -4130 detection: match the numeric token regardless of surrounding format.
             is_4130 = "4130" in err_str
             if is_4130 and attempt < max_attempts:
-                backoff = 1.5 * attempt  # 1.5 s, then 3.0 s
+                backoff = max(2.5, 2.0 * attempt)  # 2.5s, 4.0s, 6.0s, 8.0s
                 log.warning(
                     f"{symbol} SL placement hit -4130 on attempt {attempt} — "
                     f"existing closePosition SL still registered server-side. "
@@ -666,7 +748,111 @@ def _place_closeposition_sl_with_retry(
             )
             break
 
+    # Diagnostic log on exhaustion
+    try:
+        pos = get_open_position(symbol)
+        oo = len(ex.fetch_open_orders(ccxt_sym))
+        log.error(
+            f"-4130 exhausted on {symbol}: hedge={_get_hedge_mode()} "
+            f"pos_qty={pos['qty'] if pos else 0} open_orders={oo} "
+            f"last_err={str(last_err)[:200]}"
+        )
+    except Exception:
+        pass
+
     result["error"] = f"SL placement failed after {max_attempts} attempt(s): {last_err}"
+    return result
+
+
+def _place_reduceonly_sl_with_retry(
+    symbol: str,
+    sl_side: str,
+    stop_price: float,
+    qty: float,
+    max_attempts: int = 5,
+    min_wait_after_cancel: float = 1.5,
+) -> dict:
+    """reduceOnly STOP_MARKET SL — bypasses Binance's closePosition tracker.
+
+    Used for MOVE / UPDATE of an SL (BE trigger, post-TP1 sizing) to avoid the
+    closePosition duplicate-tracker race that drives -4130. Binance's reduceOnly
+    tracker is independent of the closePosition tracker — the two never collide.
+    """
+    ccxt_sym = _symbol_to_ccxt(symbol)
+    ex = _get_exchange()
+    result: dict = {"success": False, "sl_order_id": None, "error": None}
+    last_err: Optional[Exception] = None
+
+    # Idempotency pre-check
+    existing_id = _sl_already_at(symbol, sl_side, stop_price)
+    if existing_id:
+        log.info(
+            f"{symbol} SL already at target {stop_price} — skipping replace (id={existing_id})"
+        )
+        return {"success": True, "sl_order_id": existing_id, "error": None}
+
+    for attempt in range(1, max_attempts + 1):
+        cancelled_clean = cancel_open_orders(symbol)
+        wait = min_wait_after_cancel if cancelled_clean else max(min_wait_after_cancel, 2.0)
+        log.info(
+            f"{symbol} reduceOnly SL attempt {attempt}/{max_attempts}: "
+            f"cancelled_clean={cancelled_clean}, waiting {wait:.2f}s"
+        )
+        time.sleep(wait)
+
+        try:
+            params = {"stopPrice": stop_price, "reduceOnly": True}
+            ps = _position_side_for("LONG" if sl_side == "sell" else "SHORT")
+            if ps:
+                params["positionSide"] = ps
+            log.info(
+                f"PLACING SL (attempt {attempt}/{max_attempts}): "
+                f"{sl_side} reduceOnly {ccxt_sym} qty={qty} @ {stop_price}"
+            )
+            sl_order = ex.create_order(
+                symbol=ccxt_sym,
+                type="stop_market",
+                side=sl_side,
+                amount=qty,
+                params=params,
+            )
+            result.update({
+                "success": True,
+                "sl_order_id": sl_order.get("id", "unknown"),
+                "error": None,
+            })
+            log.info(f"SL placed (reduceOnly): {result['sl_order_id']} @ {stop_price}")
+            return result
+
+        except Exception as e:
+            last_err = e
+            err_str = str(e)
+            is_4130 = "4130" in err_str
+            if is_4130 and attempt < max_attempts:
+                backoff = max(2.5, 2.0 * attempt)
+                log.warning(
+                    f"{symbol} reduceOnly SL hit -4130 on attempt {attempt} — "
+                    f"backing off {backoff:.1f}s and retrying."
+                )
+                time.sleep(backoff)
+                continue
+            log.error(
+                f"{symbol} reduceOnly SL failed (attempt {attempt}/{max_attempts}): {e}"
+            )
+            break
+
+    try:
+        pos = get_open_position(symbol)
+        oo = len(ex.fetch_open_orders(ccxt_sym))
+        log.error(
+            f"-4130 exhausted on {symbol} (reduceOnly): hedge={_get_hedge_mode()} "
+            f"pos_qty={pos['qty'] if pos else 0} open_orders={oo} "
+            f"last_err={str(last_err)[:200]}"
+        )
+    except Exception:
+        pass
+
+    result["error"] = f"reduceOnly SL placement failed after {max_attempts} attempt(s): {last_err}"
     return result
 
 
@@ -696,16 +882,17 @@ def move_stop_loss(
 
     result = {"success": False, "sl_order_id": None, "error": None}
 
-    # 🔴 FIX (-4130): Delegate to the shared helper which enforces
-    # cancel → guaranteed-wait → place with -4130 retry and exponential backoff.
-    # The old inline retry loop is replaced here to keep the pattern in one place.
+    # 🔴 FIX (-4130 v2): switch MOVE path to reduceOnly to bypass Binance's
+    # closePosition duplicate-tracker race. Entry SL still uses closePosition in
+    # open_position (no prior tracker state = no race). Pre-check inside the helper
+    # short-circuits if server already has the target SL (idempotent restarts).
     try:
-        sl_result = _place_closeposition_sl_with_retry(
+        sl_result = _place_reduceonly_sl_with_retry(
             symbol=symbol,
             sl_side=sl_side,
             stop_price=sl_px,
             qty=qty,
-            max_attempts=3,
+            max_attempts=5,
         )
         result["success"]     = sl_result["success"]
         result["sl_order_id"] = sl_result["sl_order_id"]
