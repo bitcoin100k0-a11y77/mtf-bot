@@ -645,13 +645,22 @@ def tg_closed(sym, ot, capital):
 def tg_heartbeat(S):
     """Send periodic heartbeat status via Telegram."""
     sc  = S.get("start_capital") or Cfg.IC  # actual starting balance; fallback to IC
-    ret = (S["capital"] - sc) / sc * 100
-    mdd = (S["peak"]-S["capital"])/S["peak"]*100 if S["peak"]>0 else 0
+    # Prefer live equity; fall back to S["capital"] if live fetch unavailable
+    equity = S.get("live_equity") or S["capital"]
+    wallet = S.get("live_wallet") or S["capital"]
+    free   = S.get("live_free", 0.0)
+    used   = S.get("live_used", 0.0)
+    upnl   = S.get("live_unrealized", 0.0)
+    ret = (equity - sc) / sc * 100 if sc > 0 else 0.0
+    mdd = (S["peak"] - equity) / S["peak"] * 100 if S["peak"] > 0 else 0
     mode = executor.get_mode_label()
     lines = [
         f"<b>\U0001f4ca Heartbeat #{S['checks']}</b>",
         f"Mode    : {mode}",
-        f"Capital : ${S['capital']:,.2f} ({ret:+.2f}%)",
+        f"Equity  : ${equity:,.2f} ({ret:+.2f}%)",
+        f"Wallet  : ${wallet:,.2f} | Free ${free:,.2f} | Locked ${used:,.2f}",
+        f"uPnL    : ${upnl:+,.2f}",
+        f"Booked  : ${S['capital']:,.2f}   (closed P&L)",
         f"MaxDD   : {mdd:.1f}%",
         f"Trades  : {len(S['trades'])} | Signals:{S['signals']} | Chops:{S['chops']}",
         ""
@@ -962,6 +971,23 @@ def main():
         try:
             S["checks"] += 1
             log.info(f"=== Check #{S['checks']} ===")
+
+            # Live account snapshot for display/telemetry (not used for sizing).
+            acct = executor.get_futures_account_state()
+            S["live_equity"]     = acct["equity"]
+            S["live_wallet"]     = acct["wallet"]
+            S["live_free"]       = acct["free"]
+            S["live_used"]       = acct["used"]
+            S["live_unrealized"] = acct["unrealized_pnl"]
+            if acct["ok"] and acct["equity"] > 0:
+                S["peak"] = max(S.get("peak", 0.0), acct["equity"])
+            sc_disp = S.get("start_capital") or Cfg.IC
+            eq_ret = ((acct["equity"] - sc_disp) / sc_disp * 100) if sc_disp > 0 else 0.0
+            log.info(
+                f"Equity: ${acct['equity']:.2f} ({eq_ret:+.2f}%) | "
+                f"Wallet: ${acct['wallet']:.2f} | Free: ${acct['free']:.2f} | "
+                f"Locked: ${acct['used']:.2f} | uPnL: ${acct['unrealized_pnl']:+.2f}"
+            )
 
             # Reset daily circuit breaker tracking
             executor.circuit_breaker.reset_daily(S["capital"])
