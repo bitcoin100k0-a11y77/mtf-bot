@@ -167,6 +167,49 @@ def get_futures_balance() -> float:
         return 0.0
 
 
+def get_futures_account_state() -> dict:
+    """Full Futures account snapshot — for display / telemetry.
+
+    Returns dict with keys:
+      wallet         (float) — wallet balance, USDT, no unrealized
+      free           (float) — available USDT (Binance availableBalance)
+      used           (float) — locked margin = wallet - free (cross)
+      unrealized_pnl (float) — sum of unrealizedPnl across all open positions
+      equity         (float) — wallet + unrealized_pnl  (== Binance totalMarginBalance)
+      ok             (bool)  — False on fetch error; callers may fall back
+
+    Do NOT use this for margin pre-flight — use get_futures_balance() (free only).
+    """
+    try:
+        ex = _get_exchange()
+        balance = ex.fetch_balance()
+        usdt = balance.get("USDT", {}) or {}
+        wallet = float(usdt.get("total", 0.0) or 0.0)
+        free   = float(usdt.get("free",  0.0) or 0.0)
+        used   = float(usdt.get("used",  max(wallet - free, 0.0)) or 0.0)
+        unrealized = 0.0
+        try:
+            for pos in ex.fetch_positions():
+                qty = abs(float(pos.get("contracts", 0) or 0))
+                if qty > 0:
+                    unrealized += float(pos.get("unrealizedPnl", 0) or 0)
+        except Exception as pe:
+            log.warning(f"fetch_positions failed in equity calc ({pe}) - equity=wallet only")
+        equity = wallet + unrealized
+        return {
+            "wallet": wallet, "free": free, "used": used,
+            "unrealized_pnl": unrealized, "equity": equity,
+            "ok": True,
+        }
+    except Exception as e:
+        log.error(f"get_futures_account_state failed: {e}")
+        return {
+            "wallet": 0.0, "free": 0.0, "used": 0.0,
+            "unrealized_pnl": 0.0, "equity": 0.0,
+            "ok": False,
+        }
+
+
 def get_open_position(symbol: str) -> Optional[dict]:
     """Check if there is an open position on Binance for this symbol.
 
