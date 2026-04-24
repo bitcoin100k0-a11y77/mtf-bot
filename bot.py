@@ -52,7 +52,7 @@ class Cfg:
     ATR_P       = 14
 
     # ── Entry filters ─────────────────────────────────────────────
-    PULL_PCT    = 0.008       # v4: 0.8% pull-back zone (was 1.0%)
+    PULL_PCT    = 0.005       # v5: 0.5% pull-back zone (was 0.8%) — tighter = better edge
     RSI_LO      = 45          # v3: long when RSI < 45 (was 40)
     RSI_HI      = 60          # v3: short when RSI > 60 (unchanged)
     RSI_FLOOR   = 25.0
@@ -60,9 +60,9 @@ class Cfg:
     ATR_REL     = 0.70        # v4: 0.70x avg (was 0.90x) - more valid setups
     ATR_AVG_N   = 100
 
-    # ── Session filter (v3 NEW) ───────────────────────────────────
-    SESSION_START = 7         # 07:00 UTC = London open
-    SESSION_END   = 20        # 20:00 UTC = NY close
+    # ── Session filter (v5 EXPANDED) ─────────────────────────────
+    SESSION_START = 6         # v5: 06:00 UTC (was 07:00) — capture London pre-market
+    SESSION_END   = 22        # v5: 22:00 UTC (was 20:00) — capture full NY session
 
     # ── 1H RSI filter (v3 NEW) ────────────────────────────────────
     RSI_1H_LO   = 40.0        # 1H RSI must be > 40 to go LONG
@@ -77,7 +77,7 @@ class Cfg:
     TP2_FRAC    = 0.20        # v5: 20% at TP2 (was 30%); remaining 30% at TP3
     # TP1+TP2+TP3 fracs = 0.50+0.20+0.30 = 1.0
 
-    MAX_HOLD    = 48          # max bars before forced exit (5-min bars = 4 hours)
+    MAX_HOLD    = 36          # v5: 36 bars = 3h (was 48/4h) — lower DD, better PF
     IC          = 10_000.0    # initial capital (virtual tracking)
     RISK_PCT    = 0.01        # 🔴 RISK: 1.0% risk per trade
 
