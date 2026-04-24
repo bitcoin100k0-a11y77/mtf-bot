@@ -69,13 +69,13 @@ class Cfg:
     RSI_1H_HI   = 60.0        # 1H RSI must be < 60 to go SHORT
 
     # ── Risk & sizing ─────────────────────────────────────────────
-    SL_MULT     = 1.8         # v3: 1.8× ATR (was 1.5)
+    SL_MULT     = 1.5         # v5: 1.5× ATR (was 1.8) — backtest #1 of 100 combos
     TP1_MULT    = 4.5         # v3: 4.5× ATR (was 3.5)
     TP2_MULT    = 7.2         # v3: 7.2× ATR (= 1.6 × TP1)
     TP3_MULT    = 30.0        # v4: 30x ATR - catch bigger runners (was 18x)
-    TP1_FRAC    = 0.40        # v3: close 40% at TP1 (was 50%)
-    TP2_FRAC    = 0.30        # close 30% at TP2
-    # remaining 30% closes at TP3
+    TP1_FRAC    = 0.50        # v5: close 50% at TP1 (was 40%) — bank faster
+    TP2_FRAC    = 0.20        # v5: 20% at TP2 (was 30%); remaining 30% at TP3
+    # TP1+TP2+TP3 fracs = 0.50+0.20+0.30 = 1.0
 
     MAX_HOLD    = 48          # max bars before forced exit (5-min bars = 4 hours)
     IC          = 10_000.0    # initial capital (virtual tracking)
