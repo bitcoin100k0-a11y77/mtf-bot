@@ -323,23 +323,42 @@ def open_position(
     # Buffer: 5% headroom for slippage between signal price and market fill,
     # plus ~0.04% taker fee on entry + ~0.04% on eventual exit.
     try:
-        notional = qty * float(entry_price)
-        leverage = max(LEVERAGE, 1)
-        required_margin = notional / leverage
         available = get_futures_balance()
+        leverage = max(LEVERAGE, 1)
         # 🔴 FIX (-2019): 10% headroom — covers taker fees (~0.08% round-trip),
         # slippage on market fills (1-2% on 5m bar range for volatile pairs),
         # and Binance's per-symbol initial-margin-ratio quirks on small accounts.
         margin_buffer = 0.90
-        if required_margin > available * margin_buffer:
-            result["error"] = (
-                f"Insufficient margin (pre-flight): need ~${required_margin:.2f} "
-                f"(notional ${notional:.2f} / {leverage}x), have ${available:.2f} "
-                f"— skipping {direction} {symbol}. "
-                f"Fix: increase FUTURES_LEVERAGE, reduce RISK_PCT, or fund wallet."
+        max_affordable_notional = available * leverage * margin_buffer
+        notional = qty * float(entry_price)
+
+        if notional > max_affordable_notional:
+            # 🔴 FIX (margin-cap): auto-resize down instead of skip — Layer B
+            # safety net for cases where bot.py's `capital` snapshot was stale
+            # or LEVERAGE env changed mid-run. Source-side cap (bot.py) should
+            # catch most cases; this is the belt-and-suspenders execution gate.
+            new_qty = _round_qty(ccxt_sym, max_affordable_notional / float(entry_price))
+            if new_qty <= 0:
+                result["error"] = (
+                    f"Wallet too small even after auto-resize "
+                    f"(available ${available:.2f}, leverage {leverage}x, "
+                    f"min qty for {symbol} > affordable). "
+                    f"Fund wallet or raise FUTURES_LEVERAGE."
+                )
+                log.warning(result["error"])
+                return result
+            log.warning(
+                f"Auto-resized {direction} {symbol}: "
+                f"{qty} → {new_qty} (notional ${notional:.2f} → "
+                f"${new_qty * float(entry_price):.2f}, "
+                f"available ${available:.2f} @ {leverage}x)"
             )
-            log.warning(result["error"])
-            return result
+            qty = new_qty
+            notional = qty * float(entry_price)
+            required_margin = notional / leverage
+        else:
+            required_margin = notional / leverage
+
         log.info(
             f"Margin OK: need ${required_margin:.2f} / have ${available:.2f} "
             f"(notional ${notional:.2f} @ {leverage}x)"
