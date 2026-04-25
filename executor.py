@@ -325,10 +325,11 @@ def open_position(
     try:
         available = get_futures_balance()
         leverage = max(LEVERAGE, 1)
-        # 🔴 FIX (-2019): 10% headroom — covers taker fees (~0.08% round-trip),
+        # 🔴 FIX (-2019): 12% headroom — covers taker fees (~0.08% round-trip),
         # slippage on market fills (1-2% on 5m bar range for volatile pairs),
         # and Binance's per-symbol initial-margin-ratio quirks on small accounts.
-        margin_buffer = 0.90
+        # Synced with bot.py Layer-A 88% — eliminates double-shrink between layers.
+        margin_buffer = 0.88
         max_affordable_notional = available * leverage * margin_buffer
         notional = qty * float(entry_price)
 
@@ -406,14 +407,43 @@ def open_position(
     if sl_result["success"]:
         result["sl_order_id"] = sl_result["sl_order_id"]
     else:
-        # 🔴 RISK: Entry filled but SL still failed after 3 attempts — critical.
-        log.error(f"CRITICAL: SL placement failed after retries! {sl_result['error']}")
-        log.error(
-            f"MANUAL ACTION REQUIRED: Place SL for {direction} {fill_qty} "
-            f"{symbol} at {sl_px}"
-        )
-        result["error"] = f"SL placement failed (entry is open!): {sl_result['error']}"
-        # Don't return failure — entry IS open, caller must handle
+        # 🔴 FIX (Bug 3): SL failed after 3 retries → entry is naked.
+        # Old behavior left the position unguarded with success=True. New:
+        # emergency-close the entry market-side. We eat ~0.04% taker fee
+        # rather than risk an uncapped move. If emergency close ALSO fails,
+        # log loud and surface a NAKED warning to caller for manual action.
+        log.error(f"CRITICAL: SL placement failed: {sl_result['error']}")
+        log.error(f"EMERGENCY-CLOSING {direction} {fill_qty} {symbol}")
+        try:
+            close_side = "sell" if direction == "LONG" else "buy"
+            ex.create_order(
+                symbol=ccxt_sym, type="market", side=close_side,
+                amount=fill_qty, params={"reduceOnly": True},
+            )
+            log.warning(
+                f"Emergency-close OK for {direction} {fill_qty} {symbol}; "
+                f"entry rolled back due to SL failure"
+            )
+            result["success"] = False
+            result["error"] = (
+                f"SL placement failed; emergency-closed entry. "
+                f"Original error: {sl_result['error']}"
+            )
+            return result
+        except Exception as ec:
+            log.error(f"EMERGENCY CLOSE FAILED: {ec}")
+            log.error(
+                f"NAKED POSITION: {direction} {fill_qty} {symbol} — "
+                f"SL failed AND emergency close failed. Manual action required."
+            )
+            result["error"] = (
+                f"NAKED POSITION — SL failed AND emergency close failed: "
+                f"{sl_result['error']} | {ec}"
+            )
+            # Keep success=True so caller tracks the position for retry on
+            # next loop. Server-side recovery via cleanup_orphan_sl_orders.
+            result["success"] = True
+            return result
 
     return result
 
