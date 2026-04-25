@@ -28,6 +28,11 @@ Backtest (BTC, Jan–Mar 2026):
 import os, time, json, logging, requests
 from datetime import datetime, timezone
 from pathlib import Path
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent / ".env")
+except ImportError:
+    pass
 
 # ── Execution layer import ──
 import executor
@@ -480,6 +485,20 @@ def get_signal(d5, capital):
         tp3 = c + atr_val * Cfg.TP3_MULT
         be  = c + atr_val * Cfg.SL_MULT
         sz  = (capital * Cfg.RISK_PCT) / (atr_val * Cfg.SL_MULT)
+        # 🔴 FIX (margin-cap): risk-based sz ignores leverage/wallet. On small
+        # accounts during low-ATR regimes, notional can exceed wallet × leverage
+        # → pre-flight blocks trade. Cap sz so notional ≤ 85% of capital × leverage
+        # (slightly tighter than executor's 90% pre-flight buffer for headroom).
+        _lev = max(executor.LEVERAGE, 1)
+        _max_notional = capital * _lev * 0.85
+        _max_sz = _max_notional / c
+        if sz > _max_sz:
+            log.warning(
+                f"Sizing capped by margin: risk-based={sz:.6f} → "
+                f"margin-based={_max_sz:.6f} (cap notional ${_max_notional:.2f} "
+                f"@ {_lev}x on ${capital:.2f})"
+            )
+            sz = _max_sz
         return {"sig": "LONG",
                 "reason": f"15M-UP EMA+RSI {rp:.0f}→{rc:.0f}",
                 "m": m, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
@@ -499,6 +518,17 @@ def get_signal(d5, capital):
         tp3 = c - atr_val * Cfg.TP3_MULT
         be  = c - atr_val * Cfg.SL_MULT
         sz  = (capital * Cfg.RISK_PCT) / (atr_val * Cfg.SL_MULT)
+        # 🔴 FIX (margin-cap): mirror of LONG path — see comment above.
+        _lev = max(executor.LEVERAGE, 1)
+        _max_notional = capital * _lev * 0.85
+        _max_sz = _max_notional / c
+        if sz > _max_sz:
+            log.warning(
+                f"Sizing capped by margin: risk-based={sz:.6f} → "
+                f"margin-based={_max_sz:.6f} (cap notional ${_max_notional:.2f} "
+                f"@ {_lev}x on ${capital:.2f})"
+            )
+            sz = _max_sz
         return {"sig": "SHORT",
                 "reason": f"15M-DOWN EMA+RSI {rp:.0f}→{rc:.0f}",
                 "m": m, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
@@ -614,8 +644,8 @@ def tg_opened(sym, ot):
     emoji = "\U0001f7e2" if ot['dir']=='LONG' else "\U0001f534"
     tg(f"<b>{emoji} {sym} {ot['dir']} OPENED</b>\n"
        f"Entry : ${ot['entry']:,.4f}\n"
-       f"TP1   : ${ot['tp1']:,.4f}  (40% close)\n"
-       f"TP2   : ${ot['tp2']:,.4f}  (30% close)\n"
+       f"TP1   : ${ot['tp1']:,.4f}  (50% close)\n"
+       f"TP2   : ${ot['tp2']:,.4f}  (20% close)\n"
        f"TP3   : ${ot['tp3']:,.4f}  (30% close)\n"
        f"SL    : ${ot['sl']:,.4f}\n"
        f"BE    : ${ot['be']:,.4f}  (SL→entry when hit)\n"
@@ -905,8 +935,8 @@ def main():
        f"Mode     : {mode}\n"
        f"Leverage : {executor.LEVERAGE}x\n"
        f"Pairs    : {', '.join(PAIRS)}\n"
-       f"TP 40/30/30% @ 4.5R / 7.2R / 30R\n"
-       f"Session  : 07–20 UTC only\n"
+       f"TP 50/20/30% @ 4.5R / 7.2R / 30R\n"
+       f"Session  : 06–22 UTC only\n"
        f"RSI mom  : 2-bar confirmation\n"
        f"1H RSI   : filter active\n"
        f"Capital  : ${S['capital']:,.2f}\n"
