@@ -320,12 +320,21 @@ def load_state():
     return fresh_state()
 
 def save_state(S):
-    """Persist bot state to disk."""
+    """Persist bot state to disk atomically.
+
+    🔴 FIX (Bug 4): write to .tmp then atomic rename. The previous
+    write_text() truncated the target before writing — a crash mid-write
+    left botstate.json corrupt; load_state() then fell back to fresh_state
+    and ALL accumulated trades + capital sync were silently lost.
+    Path.replace() is POSIX-atomic and on Windows uses MoveFileEx with
+    replace flag (also atomic).
+    """
     try:
-        # Save circuit breaker state
         S["circuit_breaker"] = executor.circuit_breaker.to_dict()
         Cfg.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        Cfg.STATE_FILE.write_text(json.dumps(S, indent=2))
+        tmp = Cfg.STATE_FILE.with_suffix(Cfg.STATE_FILE.suffix + ".tmp")
+        tmp.write_text(json.dumps(S, indent=2))
+        tmp.replace(Cfg.STATE_FILE)
     except Exception as e:
         log.warning(f"Could not save state: {e}")
 
@@ -440,6 +449,10 @@ def get_signal(d5, capital):
     rc = d5["rsi"][i]
     rp = d5["rsi"][i-1] if d5["rsi"][i-1] else rc
     atr_val   = d5["atr"][i]
+    # 🔴 FIX (Bug 7): guard against atr=0 in flat markets — would div-by-zero
+    # in sizing formula `sz = (capital * RISK_PCT) / (atr_val * SL_MULT)`.
+    if atr_val < 1e-6:
+        return {"sig": "WATCH", "reason": "ATR ~0 (flat market)"}
     atr_avg   = d5["atr_avg"][i]
     ar        = atr_val/atr_avg if atr_avg else None
     dist      = d5["dist"][i]   if d5["dist"][i] else 999
@@ -487,10 +500,10 @@ def get_signal(d5, capital):
         sz  = (capital * Cfg.RISK_PCT) / (atr_val * Cfg.SL_MULT)
         # 🔴 FIX (margin-cap): risk-based sz ignores leverage/wallet. On small
         # accounts during low-ATR regimes, notional can exceed wallet × leverage
-        # → pre-flight blocks trade. Cap sz so notional ≤ 85% of capital × leverage
-        # (slightly tighter than executor's 90% pre-flight buffer for headroom).
+        # → pre-flight blocks trade. Cap sz so notional ≤ 88% of capital × leverage
+        # (synced with executor's Layer-B 88% — eliminates double-shrink between layers).
         _lev = max(executor.LEVERAGE, 1)
-        _max_notional = capital * _lev * 0.85
+        _max_notional = capital * _lev * 0.88
         _max_sz = _max_notional / c
         if sz > _max_sz:
             log.warning(
@@ -502,7 +515,7 @@ def get_signal(d5, capital):
         return {"sig": "LONG",
                 "reason": f"15M-UP EMA+RSI {rp:.0f}→{rc:.0f}",
                 "m": m, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
-                "be": be, "sz": sz}
+                "be": be, "sz": sz, "atr": atr_val}
 
     # ── SHORT signal ─────────────────────────────────────────────
     if (d5["tf_dn"][i]
@@ -520,7 +533,7 @@ def get_signal(d5, capital):
         sz  = (capital * Cfg.RISK_PCT) / (atr_val * Cfg.SL_MULT)
         # 🔴 FIX (margin-cap): mirror of LONG path — see comment above.
         _lev = max(executor.LEVERAGE, 1)
-        _max_notional = capital * _lev * 0.85
+        _max_notional = capital * _lev * 0.88
         _max_sz = _max_notional / c
         if sz > _max_sz:
             log.warning(
@@ -532,7 +545,7 @@ def get_signal(d5, capital):
         return {"sig": "SHORT",
                 "reason": f"15M-DOWN EMA+RSI {rp:.0f}→{rc:.0f}",
                 "m": m, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
-                "be": be, "sz": sz}
+                "be": be, "sz": sz, "atr": atr_val}
 
     reason = f"15M:{tr_d}"
     if not near: reason += f" | dist {dist*100:.3f}%"
@@ -776,15 +789,35 @@ def execute_entry(sym: str, result: dict) -> dict:
     fill_price = exec_result["fill_price"] or entry_price
     fill_qty = exec_result["fill_qty"] or size
 
+    # 🔴 FIX (Bug 1+2): re-anchor SL/TP/BE to actual fill price using ATR distance.
+    # Storing signal-time SL with fill-time entry breaks the ATR-distance
+    # invariant under slippage — on tight SL_MULT (1.5×ATR), even $50–100 of
+    # slippage on BTC can flip SL to the WRONG SIDE of entry, causing instant
+    # stop-out or "would trigger immediately" rejection from Binance.
+    # Live failure 2026-04-25: SL was $22 ABOVE LONG entry due to this.
+    atr_d = result["atr"]
+    if sig == "LONG":
+        new_sl  = fill_price - atr_d * Cfg.SL_MULT
+        new_tp1 = fill_price + atr_d * Cfg.TP1_MULT
+        new_tp2 = fill_price + atr_d * Cfg.TP2_MULT
+        new_tp3 = fill_price + atr_d * Cfg.TP3_MULT
+        new_be  = fill_price + atr_d * Cfg.SL_MULT
+    else:  # SHORT
+        new_sl  = fill_price + atr_d * Cfg.SL_MULT
+        new_tp1 = fill_price - atr_d * Cfg.TP1_MULT
+        new_tp2 = fill_price - atr_d * Cfg.TP2_MULT
+        new_tp3 = fill_price - atr_d * Cfg.TP3_MULT
+        new_be  = fill_price - atr_d * Cfg.SL_MULT
+
     new_ot = {
         "symbol":         sym,
         "dir":            sig,
-        "entry":          fill_price,  # 🔴 RISK: using actual fill, not signal price
-        "sl":             sl_price,
-        "tp1":            result["tp1"],
-        "tp2":            result["tp2"],
-        "tp3":            result["tp3"],
-        "be":             result["be"],
+        "entry":          fill_price,
+        "sl":             new_sl,
+        "tp1":            new_tp1,
+        "tp2":            new_tp2,
+        "tp3":            new_tp3,
+        "be":             new_be,
         "size":           fill_qty,     # actual filled quantity
         "be_hit":         False,
         "tp1_hit":        False,
@@ -801,11 +834,43 @@ def execute_entry(sym: str, result: dict) -> dict:
         "exec_fill_price": fill_price,
     }
 
+    # 🔴 FIX (Bug 1 cont.): server-side SL was placed at signal-time SL by
+    # open_position. If slippage > 25% of ATR, refresh the server SL to the
+    # fill-anchored value so Binance's stop matches the bot's tracked SL.
+    # Sub-quarter-ATR slips skip the extra REST call.
+    if abs(sl_price - new_sl) > atr_d * 0.25:
+        slip = fill_price - entry_price
+        log.warning(
+            f"Slippage re-anchor: SL ${sl_price:.4f} → ${new_sl:.4f} "
+            f"(slip ${slip:+.4f}, atr ${atr_d:.4f}). Refreshing server SL."
+        )
+        try:
+            mv = executor.move_stop_loss(
+                symbol=sym, direction=sig,
+                new_sl_price=new_sl, remaining_qty=fill_qty,
+            )
+            if not mv["success"]:
+                log.error(f"Slippage re-anchor SL move failed: {mv['error']}")
+                tg_exec_error(sym, "SL RE-ANCHOR", mv["error"])
+        except Exception as _e:
+            log.error(f"Slippage re-anchor exception: {_e}")
+
     return new_ot
 
 
-def execute_partial_tp(sym: str, ot: dict, tp_level: str, fraction: float) -> None:
+def execute_partial_tp(sym: str, ot: dict, tp_level: str, fraction: float) -> bool:
     """Execute a partial TP close on the exchange.
+
+    Returns True on success, False on failure. On failure, the optimistic
+    state mutations made by check_exits() are ROLLED BACK so the next bar
+    can re-detect the TP hit and retry — preventing rem from diverging
+    from actual on-exchange position size.
+
+    🔴 FIX (Bug 6): previously ot["rem"]/ot["pnl"]/ot["tpN_hit"] were
+    decremented in check_exits BEFORE exchange confirmed close. A failed
+    close left rem at the smaller value while Binance still held 100% —
+    causing dust accumulation, wrong tg_tp_hit displays, and wrong
+    SL-update qty after partial.
 
     Args:
         sym: pair symbol
@@ -823,6 +888,23 @@ def execute_partial_tp(sym: str, ot: dict, tp_level: str, fraction: float) -> No
     if not result["success"]:
         log.error(f"{tp_level} execution failed for {sym}: {result['error']}")
         tg_exec_error(sym, f"{tp_level} PARTIAL CLOSE", result["error"])
+        # Roll back optimistic state mutations from check_exits()
+        tp_key = tp_level.lower() + "_hit"      # "tp1_hit" / "tp2_hit" / "tp3_hit"
+        tp_px_key = tp_level.lower()            # "tp1" / "tp2" / "tp3"
+        if ot.get(tp_key):
+            # Recompute and reverse the speculative pnl + rem decrement
+            dirn = ot["dir"]
+            tp_px = ot[tp_px_key]
+            entry = ot["entry"]
+            speculative_pnl = ((tp_px - entry) if dirn == "LONG" else (entry - tp_px)) * ot["size"] * fraction
+            ot["pnl"] -= speculative_pnl
+            ot["rem"] += fraction
+            ot[tp_key] = False
+            log.warning(
+                f"{sym} {tp_level} state rolled back — rem→{ot['rem']*100:.0f}%, "
+                f"pnl→${ot['pnl']:+.2f}. Will retry next bar if price still beyond TP."
+            )
+        return False
 
     # After partial close, update the server-side SL to match reduced qty
     remaining_qty = ot["size"] * ot["rem"]
@@ -836,6 +918,7 @@ def execute_partial_tp(sym: str, ot: dict, tp_level: str, fraction: float) -> No
         if not sl_result["success"]:
             log.error(f"SL update after {tp_level} failed: {sl_result['error']}")
             tg_exec_error(sym, f"SL UPDATE after {tp_level}", sl_result["error"])
+    return True
 
 
 def execute_breakeven(sym: str, ot: dict) -> None:
@@ -1002,7 +1085,7 @@ def main():
             S["checks"] += 1
             log.info(f"=== Check #{S['checks']} ===")
 
-            # Live account snapshot for display/telemetry (not used for sizing).
+            # Live account snapshot for display/telemetry AND sizing.
             acct = executor.get_futures_account_state()
             S["live_equity"]     = acct["equity"]
             S["live_wallet"]     = acct["wallet"]
@@ -1011,6 +1094,12 @@ def main():
             S["live_unrealized"] = acct["unrealized_pnl"]
             if acct["ok"] and acct["equity"] > 0:
                 S["peak"] = max(S.get("peak", 0.0), acct["equity"])
+                # 🔴 FIX (Bug 9): refresh S["capital"] from live equity at top
+                # of every cycle so the sizing formula sees fresh wallet state.
+                # Previously S["capital"] was only set at startup or after a
+                # close — across a 3-pair cycle, partial closes mid-loop never
+                # propagated to subsequent symbols' get_signal() calls.
+                S["capital"] = acct["equity"]
             sc_disp = S.get("start_capital") or Cfg.IC
             eq_ret = ((acct["equity"] - sc_disp) / sc_disp * 100) if sc_disp > 0 else 0.0
             log.info(
@@ -1040,14 +1129,14 @@ def main():
                     if ot:
                         events, closed, c_reason, c_px = check_exits(ot, d5)
 
-                        # Execute events on exchange
+                        # Execute events on exchange — only notify Telegram on confirmed close
                         for ev in events:
                             if ev.startswith("TP1"):
-                                execute_partial_tp(sym, ot, "TP1", Cfg.TP1_FRAC)
-                                tg_tp_hit(sym, ot, "TP1")
+                                if execute_partial_tp(sym, ot, "TP1", Cfg.TP1_FRAC):
+                                    tg_tp_hit(sym, ot, "TP1")
                             elif ev.startswith("TP2"):
-                                execute_partial_tp(sym, ot, "TP2", Cfg.TP2_FRAC)
-                                tg_tp_hit(sym, ot, "TP2")
+                                if execute_partial_tp(sym, ot, "TP2", Cfg.TP2_FRAC):
+                                    tg_tp_hit(sym, ot, "TP2")
                             elif ev.startswith("TP3"):
                                 # TP3 = full close, handled below
                                 tg_tp_hit(sym, ot, "TP3")
