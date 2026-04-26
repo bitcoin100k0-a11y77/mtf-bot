@@ -470,24 +470,56 @@ def close_partial(
     ccxt_sym = _symbol_to_ccxt(symbol)
     # To close a LONG, we sell; to close a SHORT, we buy
     close_side = "sell" if direction == "LONG" else "buy"
-    qty = _round_qty(ccxt_sym, total_size * fraction)
 
     result = {"success": False, "fill_price": None, "fill_qty": None, "error": None}
 
-    if qty <= 0:
-        result["error"] = f"Partial close qty rounds to 0 for {symbol}"
-        log.warning(result["error"])
-        return result
-
     try:
         ex = _get_exchange()
-        log.info(f"{reason}: closing {fraction*100:.0f}% → {close_side} {qty} {ccxt_sym}")
+
+        # 🔴 FIX -2022 (Bug 1): pre-flight position check using ACTUAL exchange qty.
+        # Bot's `total_size * fraction` may exceed remaining position qty after
+        # entry slippage, prior partial fills, or auto-deleveraging. Binance
+        # rejects any reduceOnly with qty > current position with -2022.
+        pos = get_open_position(symbol)
+        if pos is None or pos["qty"] <= 0:
+            log.warning(
+                f"{symbol}: no position on exchange — {reason} treated as already-closed"
+            )
+            result.update({"success": True, "fill_price": 0.0, "fill_qty": 0.0})
+            return result
+
+        actual_qty = pos["qty"]
+        desired_qty = total_size * fraction
+        # Cap close at actual remaining; floor-round to step size.
+        qty = _round_qty(ccxt_sym, min(desired_qty, actual_qty))
+
+        if qty <= 0:
+            result["error"] = (
+                f"{reason} close qty rounds to 0 (desired {desired_qty:.6f}, "
+                f"actual {actual_qty:.6f})"
+            )
+            log.warning(result["error"])
+            return result
+
+        # 🔴 FIX -2022 (Bug 1): include positionSide for hedge mode.
+        # In dualSidePosition=True accounts, Binance requires positionSide on
+        # every reduceOnly order to disambiguate LONG-side vs SHORT-side.
+        # Missing it → -2022 ReduceOnly Order is rejected.
+        params = {"reduceOnly": True}
+        ps = _position_side_for(direction)
+        if ps:
+            params["positionSide"] = ps
+
+        log.info(
+            f"{reason}: closing {fraction*100:.0f}% → {close_side} {qty} {ccxt_sym} "
+            f"(actual_pos={actual_qty:.6f}, hedge={_get_hedge_mode()})"
+        )
         order = ex.create_order(
             symbol=ccxt_sym,
             type="market",
             side=close_side,
             amount=qty,
-            params={"reduceOnly": True},
+            params=params,
         )
         fill_price = float(order.get("average", 0) or order.get("price", 0))
         fill_qty = float(order.get("filled", qty))
@@ -706,6 +738,41 @@ def _sl_already_at(symbol: str, sl_side: str, target_px: float, tol_pct: float =
     return None
 
 
+def _verify_sl_placed(
+    symbol: str,
+    sl_side: str,
+    target_px: float,
+    tol_pct: float = 0.1,
+    max_polls: int = 4,
+    poll_delay: float = 0.4,
+) -> bool:
+    """Verify a STOP_MARKET exists at target_px (±tol_pct %) for sl_side.
+
+    🔴 FIX (Bug 2): Binance's create_order response is NOT a guarantee that
+    the order is queryable yet — order-list settlement can lag the response
+    by up to a few hundred ms. Without this verification step, the helper's
+    `success=True` flag can be a lie. If the SL never actually shows up on
+    the exchange, the caller will think it's protected when it isn't.
+
+    Polls fetch_open_orders up to `max_polls` times, sleeping `poll_delay`
+    seconds between polls. Returns True if confirmed; False otherwise.
+    """
+    for i in range(max_polls):
+        existing_id = _sl_already_at(symbol, sl_side, target_px, tol_pct)
+        if existing_id:
+            log.info(
+                f"{symbol} SL verified at {target_px} after {i+1} poll(s) "
+                f"(id={existing_id})"
+            )
+            return True
+        time.sleep(poll_delay)
+    log.error(
+        f"{symbol} SL verification FAILED — no STOP_MARKET found at {target_px} "
+        f"after {max_polls} polls (tol {tol_pct}%)"
+    )
+    return False
+
+
 def _place_closeposition_sl_with_retry(
     symbol: str,
     sl_side: str,          # "sell" (close LONG) or "buy" (close SHORT)
@@ -769,9 +836,26 @@ def _place_closeposition_sl_with_retry(
                 amount=qty,
                 params=params,
             )
+            order_id = sl_order.get("id", "unknown")
+
+            # 🔴 FIX (Bug 2): verify the SL actually shows in open orders before
+            # declaring success. create_order's response can lead the order-list
+            # by hundreds of ms; without this check, the caller may trust a
+            # success flag that's not yet reflected on the exchange.
+            if not _verify_sl_placed(symbol, sl_side, stop_price):
+                last_err = Exception(
+                    f"closePosition SL placement returned id={order_id} but "
+                    f"verification poll found no STOP_MARKET at {stop_price}"
+                )
+                log.error(str(last_err))
+                if attempt < max_attempts:
+                    time.sleep(max(2.5, 2.0 * attempt))
+                    continue
+                break
+
             result.update({
                 "success": True,
-                "sl_order_id": sl_order.get("id", "unknown"),
+                "sl_order_id": order_id,
                 "error": None,
             })
             log.info(f"SL placed: {result['sl_order_id']} @ {stop_price}")
@@ -865,9 +949,26 @@ def _place_reduceonly_sl_with_retry(
                 amount=qty,
                 params=params,
             )
+            order_id = sl_order.get("id", "unknown")
+
+            # 🔴 FIX (Bug 2): verify the reduceOnly SL is actually queryable in
+            # open orders before declaring success. Without this, a race where
+            # create_order succeeds but order-list lookup fails leaves the bot
+            # trusting a non-existent SL and the position effectively naked.
+            if not _verify_sl_placed(symbol, sl_side, stop_price):
+                last_err = Exception(
+                    f"reduceOnly SL placement returned id={order_id} but "
+                    f"verification poll found no STOP_MARKET at {stop_price}"
+                )
+                log.error(str(last_err))
+                if attempt < max_attempts:
+                    time.sleep(max(2.5, 2.0 * attempt))
+                    continue
+                break
+
             result.update({
                 "success": True,
-                "sl_order_id": sl_order.get("id", "unknown"),
+                "sl_order_id": order_id,
                 "error": None,
             })
             log.info(f"SL placed (reduceOnly): {result['sl_order_id']} @ {stop_price}")
