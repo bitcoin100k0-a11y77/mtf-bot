@@ -570,10 +570,16 @@ def check_exits(ot, d5):
     events = []
 
     # ── Breakeven trigger ────────────────────────────────────────
+    # 🔴 FIX (Bug 5): defer ot["sl"] = ot["entry"] mutation to execute_breakeven.
+    # Previously this was set OPTIMISTICALLY here, before the exchange-side SL
+    # move was even attempted — leaving local state lying about exchange state
+    # when move_stop_loss subsequently failed. execute_breakeven now updates
+    # ot["sl"] to entry only after move_stop_loss confirms success; on failure
+    # ot["sl"] remains at the OLD (loss-level) value so downstream checks see
+    # the truth.
     if not ot.get("be_hit", False):
         if (dirn=="LONG"  and h >= ot["be"]) or \
            (dirn=="SHORT" and l <= ot["be"]):
-            ot["sl"]     = ot["entry"]
             ot["be_hit"] = True
             events.append("BE_TRIGGERED")
 
@@ -916,23 +922,71 @@ def execute_partial_tp(sym: str, ot: dict, tp_level: str, fraction: float) -> bo
             new_remaining_qty=remaining_qty,
         )
         if not sl_result["success"]:
-            log.error(f"SL update after {tp_level} failed: {sl_result['error']}")
+            log.error(
+                f"SL update after {tp_level} failed: {sl_result['error']} — "
+                f"position protected by stale-qty SL; close_full_position dust "
+                f"fallback handles eventual close. Manual review recommended."
+            )
             tg_exec_error(sym, f"SL UPDATE after {tp_level}", sl_result["error"])
+            # 🔴 FIX (Bug 4): SL update failure leaves the server-side SL still
+            # tied to the ORIGINAL qty. Binance will reduceOnly-reject it when
+            # triggered, but close_full_position's dust-position fallback
+            # (closePosition=True STOP_MARKET) handles the eventual close.
+            # No emergency close here — the partial TP profit is already booked,
+            # and the remaining position is still protected (just by an old SL
+            # at the wrong qty, not catastrophic). Loud log for ops visibility.
     return True
 
 
 def execute_breakeven(sym: str, ot: dict) -> None:
-    """Move the server-side stop-loss to breakeven (entry price)."""
+    """Move the server-side stop-loss to breakeven (entry price).
+
+    🔴 FIX (Bug 2/3): on move_stop_loss failure, the OLD loss-level SL may
+    STILL be on the exchange (cancel verification timed out, or place hit
+    -4130/-2022 after retries). Letting it sit means the trade closes at
+    LOSS when price reverses to that level while the bot reports "BE close"
+    (because be_hit=True locally).
+
+    Emergency action: market-close the position now to lock in the
+    BE-or-better profit. Price IS currently above BE_TRIGGER (entry +
+    1.5*ATR for LONG) by definition of BE_TRIGGERED firing, so a market
+    close at this point is at minimum a small profit.
+    """
     remaining_qty = ot["size"] * ot["rem"]
+
     result = executor.move_stop_loss(
         symbol=sym,
         direction=ot["dir"],
         new_sl_price=ot["entry"],
         remaining_qty=remaining_qty,
     )
-    if not result["success"]:
-        log.error(f"BE move failed for {sym}: {result['error']}")
-        tg_exec_error(sym, "BREAKEVEN SL MOVE", result["error"])
+    if result["success"]:
+        ot["sl"] = ot["entry"]   # only NOW trust the local mirror (Fix 5)
+        return
+
+    # SL move failed. Local ot["sl"] still holds the OLD loss-level SL
+    # (Fix 5 deferred the optimistic mutation in check_exits). Exchange
+    # may still have the old SL — emergency close to lock in profit.
+    log.error(f"BE move failed for {sym}: {result['error']}")
+    tg_exec_error(sym, "BREAKEVEN SL MOVE", result["error"])
+
+    # Allow re-trigger next bar in case emergency close also fails.
+    ot["be_hit"] = False
+
+    log.warning(
+        f"{sym} BE move failed — emergency market-close to lock in profit"
+    )
+    close_result = executor.close_full_position(sym, ot["dir"])
+    if close_result.get("success"):
+        ot["_be_emergency_close"] = True
+        ot["_emergency_close_px"] = close_result.get("fill_price", ot["entry"])
+        tg(f"<b>⚠️ {sym} — BE move failed, emergency-closed at market</b>")
+    else:
+        log.error(
+            f"{sym} BE emergency close ALSO failed: "
+            f"{close_result.get('error')}"
+        )
+        tg_exec_error(sym, "BE EMERGENCY CLOSE", close_result.get("error", "unknown"))
 
 
 def execute_full_close(sym: str, ot: dict, reason: str) -> bool:
@@ -1142,8 +1196,45 @@ def main():
                                 tg_tp_hit(sym, ot, "TP3")
                             elif ev == "BE_TRIGGERED":
                                 execute_breakeven(sym, ot)
-                                tg(f"<b>\U0001f6e1 {sym} — Breakeven triggered!</b>\n"
-                                   f"SL moved to entry: ${ot['entry']:,.4f}")
+                                # 🔴 FIX (Bug 3): if BE move failed and emergency
+                                # market-close fired, book the trade now and pop
+                                # it from open_trades so the close-retry path
+                                # below doesn't double-act.
+                                if ot.get("_be_emergency_close"):
+                                    fill_px = ot.get("_emergency_close_px", ot["entry"])
+                                    realized = (
+                                        ((fill_px - ot["entry"])
+                                         if ot["dir"] == "LONG"
+                                         else (ot["entry"] - fill_px))
+                                        * ot["size"] * ot["rem"]
+                                    )
+                                    ot["pnl"] += realized
+                                    ot["rem"] = 0.0
+                                    ot["close_reason"] = "BE_EMERGENCY"
+                                    S["capital"] += ot["pnl"]
+                                    S["peak"] = max(S["peak"], S["capital"])
+                                    S["trades"].append({
+                                        **ot, "symbol": sym,
+                                        "close_time": datetime.now(timezone.utc).isoformat(),
+                                    })
+                                    ps["trades"] += 1
+                                    ps["pnl"] += ot["pnl"]
+                                    if ot["pnl"] > 0:
+                                        ps["wins"] += 1
+                                    S["open_trades"].pop(sym, None)
+                                    executor.circuit_breaker.record_trade(ot["pnl"], S["capital"])
+                                    if executor.circuit_breaker.is_tripped():
+                                        tg_circuit_breaker(executor.circuit_breaker.trip_reason)
+                                    log.info(
+                                        f"{sym} BE_EMERGENCY CLOSED {ot['dir']} "
+                                        f"P&L ${ot['pnl']:+.2f} | cap=${S['capital']:.2f}"
+                                    )
+                                    tg_closed(sym, ot, S["capital"])
+                                    save_state(S)
+                                    break  # skip remaining events; trade is closed
+                                else:
+                                    tg(f"<b>\U0001f6e1 {sym} — Breakeven triggered!</b>\n"
+                                       f"SL moved to entry: ${ot['entry']:,.4f}")
 
                         if closed:
                             ot["close_reason"] = c_reason
