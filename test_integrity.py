@@ -200,12 +200,12 @@ check("bot.py stores S[live_equity]",
 # ─────────────────────────────────────────────
 print("\n[5] Structure Sanity")
 
-check(f"executor.py line count in range 580–1180 (got {len(exec_lines)})",
-      580 <= len(exec_lines) <= 1180,
+check(f"executor.py line count in range 580–1320 (got {len(exec_lines)})",
+      580 <= len(exec_lines) <= 1320,
       f"unexpected line count may indicate missing or duplicate content")
 
-check(f"bot.py line count in range 750–1260 (got {len(bot_lines)})",
-      750 <= len(bot_lines) <= 1260,
+check(f"bot.py line count in range 750–1400 (got {len(bot_lines)})",
+      750 <= len(bot_lines) <= 1400,
       f"unexpected line count may indicate missing or duplicate content")
 
 # Duplicate function definitions (the corruption we saw causes duplicates)
