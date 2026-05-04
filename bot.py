@@ -267,11 +267,24 @@ def cleanup_orphan_sl_orders(S: dict) -> None:
             direction    = ot["dir"]
             remaining_qty = ot["size"] * ot.get("rem", 1.0)
             sl_price     = ot["sl"]
+            # 🔴 FIX (Fix E): guard against phantom positions in open_trades.
+            # If reconcile missed it (race between fetch_positions and reconcile)
+            # OR position was closed manually on Binance after reconcile ran,
+            # move_stop_loss would cancel any unrelated orders on the symbol
+            # and try to place an SL on a non-existent position.
+            pos = executor.get_open_position(sym)
+            if pos is None or pos.get("qty", 0) <= 0:
+                log.warning(
+                    f"Orphan SL cleanup: {sym} tracked trade has zero exchange "
+                    f"position — skipping SL refresh (phantom in open_trades)"
+                )
+                continue
             log.info(
                 f"Orphan SL cleanup: refreshing SL for {sym} "
-                f"({direction} qty={remaining_qty:.6f} sl={sl_price})"
+                f"({direction} qty={remaining_qty:.6f} sl={sl_price} "
+                f"exchange_qty={pos['qty']:.6f})"
             )
-            # move_stop_loss → _place_closeposition_sl_with_retry (cancel + wait + retry)
+            # move_stop_loss → _place_reduceonly_sl_with_retry (cancel + wait + retry)
             result = executor.move_stop_loss(
                 symbol=sym,
                 direction=direction,
