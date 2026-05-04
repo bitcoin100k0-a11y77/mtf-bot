@@ -393,17 +393,44 @@ def open_position(
         return result
 
     # 2) Server-side stop-loss via retry helper
-    # 🔴 FIX (-4130): raw create_order was attempted once; if a stale SL from a
-    # prior crash existed on Binance, it hit -4130 and left the entry naked.
-    # The helper cancels first, waits for Binance's internal tracker to settle,
-    # then retries up to 3 times on -4130 with exponential backoff.
-    sl_result = _place_closeposition_sl_with_retry(
+    # 🔴 FIX (-4130 v2): closePosition tracker on Binance lags 500ms-1500ms+
+    # after cancel. Even with min_wait_after_cancel and 3 retries, the race
+    # wins under load — placing a fresh closePosition SL on a stale tracker
+    # gets rejected with -4130 every time. reduceOnly STOP_MARKET orders use
+    # a SEPARATE ledger and never touch the closePosition tracker. Position
+    # fill_qty is known exactly here, so reduceOnly is the safer primary.
+    # The helper auto-falls-back to closePosition for sub-min-lot dust.
+    sl_result = _place_reduceonly_sl_with_retry(
         symbol=symbol,
         sl_side=sl_side,
         stop_price=sl_px,
         qty=fill_qty,
         max_attempts=3,
     )
+    # 🔴 FIX (-2022/-4130 cross-fallback): if primary path (reduceOnly) failed,
+    # try the OTHER path (closePosition) once before emergency-closing the
+    # entry. -4130 only affects closePosition; -2022 only affects reduceOnly.
+    # Cancel was already run inside the failed primary helper so no orphan
+    # orders remain. Cross-helper attempt is independent. Cheaper than
+    # eating fees on emergency rollback.
+    if not sl_result["success"]:
+        log.warning(
+            f"{symbol} primary SL path failed: {sl_result['error']} "
+            f"— attempting closePosition fallback"
+        )
+        fallback = _place_closeposition_sl_with_retry(
+            symbol=symbol,
+            sl_side=sl_side,
+            stop_price=sl_px,
+            qty=fill_qty,
+            max_attempts=2,
+        )
+        if fallback["success"]:
+            log.info(
+                f"{symbol} closePosition fallback SUCCEEDED — entry protected"
+            )
+            sl_result = fallback
+
     if sl_result["success"]:
         result["sl_order_id"] = sl_result["sl_order_id"]
     else:
@@ -700,11 +727,86 @@ def cancel_open_orders(symbol: str) -> bool:
         return False
 
 
-def _fetch_current_sl(symbol: str, sl_side: str) -> Optional[dict]:
+def _dump_open_orders_on_4130(symbol: str, ctx: str) -> None:
+    """Log every open order's full state on -4130. Operational visibility.
+
+    🔴 FIX (-4130 v2 / Fix D): When -4130 fires, we want to know exactly
+    what's still on the exchange — closePosition flag, reduceOnly flag,
+    side, stopPrice, positionSide, order id. One extra API call when
+    already in error state; cost is acceptable for the diagnostic value.
+    """
+    try:
+        ex = _get_exchange()
+        ccxt_sym = _symbol_to_ccxt(symbol)
+        open_orders = ex.fetch_open_orders(ccxt_sym)
+        log.error(
+            f"{symbol} -4130 diagnostic ({ctx}) — {len(open_orders)} open orders:"
+        )
+        for o in open_orders:
+            info = o.get("info", {}) or {}
+            log.error(
+                f"  id={o.get('id')} type={info.get('type')} "
+                f"side={info.get('side')} stopPrice={info.get('stopPrice')} "
+                f"closePosition={info.get('closePosition')} "
+                f"reduceOnly={info.get('reduceOnly')} "
+                f"positionSide={info.get('positionSide')}"
+            )
+    except Exception as e:
+        log.warning(f"{symbol} -4130 diagnostic dump failed: {e}")
+
+
+def _is_truthy_flag(v) -> bool:
+    """Coerce Binance/CCXT info-dict flag to bool. Handles True, 'true', 'True'."""
+    if v is True:
+        return True
+    if isinstance(v, str) and v.strip().lower() == "true":
+        return True
+    return False
+
+
+def _order_matches_type(order: dict, expected_type: Optional[str]) -> bool:
+    """Check whether an order matches the expected_type filter.
+
+    expected_type:
+      - "closePosition" → only orders with closePosition=True
+      - "reduceOnly"    → only orders with reduceOnly=True (and NOT closePosition)
+      - None            → any STOP_MARKET (legacy, backward-compat)
+
+    🔴 FIX (-4130 v2 / Fix C): Without this filter, _sl_already_at would
+    return a stale closePosition order's id when the caller is trying to
+    place a NEW reduceOnly SL at the same price. The pre-check would skip
+    placement → position effectively guarded by the wrong order type.
+    Defensive fallback: if the info dict lacks the flag (CCXT version
+    variance), treat as "match" to preserve legacy behavior — no regression.
+    """
+    if expected_type is None:
+        return True
+    info = order.get("info", {}) or {}
+    has_cp_key = "closePosition" in info
+    has_ro_key = "reduceOnly" in info
+    cp = _is_truthy_flag(info.get("closePosition"))
+    ro = _is_truthy_flag(info.get("reduceOnly"))
+    if expected_type == "closePosition":
+        if not has_cp_key:
+            return True  # defensive — assume legacy match
+        return cp
+    if expected_type == "reduceOnly":
+        if not has_ro_key:
+            return True  # defensive — assume legacy match
+        return ro and not cp
+    return True
+
+
+def _fetch_current_sl(
+    symbol: str, sl_side: str, expected_type: Optional[str] = None
+) -> Optional[dict]:
     """Return the currently-active STOP_MARKET on symbol matching sl_side, or None.
 
     Used for idempotency pre-check before placing a new SL: if server already has
     the desired SL, we skip cancel+place entirely and avoid the -4130 race.
+
+    expected_type filters by closePosition vs reduceOnly to prevent false-positive
+    matches on the wrong order kind. None = legacy any-match.
     """
     try:
         ex = _get_exchange()
@@ -714,16 +816,23 @@ def _fetch_current_sl(symbol: str, sl_side: str) -> Optional[dict]:
             o_type = (info.get("type") or o.get("type") or "").upper()
             o_side = (info.get("side") or o.get("side") or "").lower()
             if "STOP" in o_type and o_side == sl_side.lower():
-                return o
+                if _order_matches_type(o, expected_type):
+                    return o
         return None
     except Exception as e:
         log.warning(f"fetch_current_sl failed for {symbol}: {e}")
         return None
 
 
-def _sl_already_at(symbol: str, sl_side: str, target_px: float, tol_pct: float = 0.1) -> Optional[str]:
-    """If an SL is already present at target_px (±tol_pct %), return its id; else None."""
-    existing = _fetch_current_sl(symbol, sl_side)
+def _sl_already_at(
+    symbol: str,
+    sl_side: str,
+    target_px: float,
+    tol_pct: float = 0.1,
+    expected_type: Optional[str] = None,
+) -> Optional[str]:
+    """If an SL of expected_type is at target_px (±tol_pct %), return its id; else None."""
+    existing = _fetch_current_sl(symbol, sl_side, expected_type=expected_type)
     if not existing:
         return None
     info = existing.get("info", {}) or {}
@@ -745,8 +854,9 @@ def _verify_sl_placed(
     tol_pct: float = 0.1,
     max_polls: int = 4,
     poll_delay: float = 0.4,
+    expected_type: Optional[str] = None,
 ) -> bool:
-    """Verify a STOP_MARKET exists at target_px (±tol_pct %) for sl_side.
+    """Verify a STOP_MARKET of expected_type exists at target_px (±tol_pct %) for sl_side.
 
     🔴 FIX (Bug 2): Binance's create_order response is NOT a guarantee that
     the order is queryable yet — order-list settlement can lag the response
@@ -754,21 +864,27 @@ def _verify_sl_placed(
     `success=True` flag can be a lie. If the SL never actually shows up on
     the exchange, the caller will think it's protected when it isn't.
 
+    🔴 FIX (-4130 v2 / Fix C): expected_type filter prevents false-positive
+    verification when a stale closePosition order matches a fresh reduceOnly
+    placement at the same price (or vice versa).
+
     Polls fetch_open_orders up to `max_polls` times, sleeping `poll_delay`
     seconds between polls. Returns True if confirmed; False otherwise.
     """
     for i in range(max_polls):
-        existing_id = _sl_already_at(symbol, sl_side, target_px, tol_pct)
+        existing_id = _sl_already_at(
+            symbol, sl_side, target_px, tol_pct, expected_type=expected_type
+        )
         if existing_id:
             log.info(
                 f"{symbol} SL verified at {target_px} after {i+1} poll(s) "
-                f"(id={existing_id})"
+                f"(id={existing_id}, type={expected_type or 'any'})"
             )
             return True
         time.sleep(poll_delay)
     log.error(
-        f"{symbol} SL verification FAILED — no STOP_MARKET found at {target_px} "
-        f"after {max_polls} polls (tol {tol_pct}%)"
+        f"{symbol} SL verification FAILED — no STOP_MARKET ({expected_type or 'any'}) "
+        f"found at {target_px} after {max_polls} polls (tol {tol_pct}%)"
     )
     return False
 
@@ -779,7 +895,7 @@ def _place_closeposition_sl_with_retry(
     stop_price: float,     # already-rounded stop price
     qty: float,            # ignored by Binance when closePosition=True, but CCXT requires a value
     max_attempts: int = 5,
-    min_wait_after_cancel: float = 1.5,
+    min_wait_after_cancel: float = 2.5,   # 🔴 FIX (Fix F): bumped 1.5→2.5 — tracker observed up to ~2s under load
 ) -> dict:
     """Single source of truth for placing a closePosition STOP_MARKET on Binance Futures.
 
@@ -801,11 +917,15 @@ def _place_closeposition_sl_with_retry(
     result: dict = {"success": False, "sl_order_id": None, "error": None}
     last_err: Optional[Exception] = None
 
-    # Idempotency pre-check: if an SL already sits at the target price, skip cancel+place.
-    existing_id = _sl_already_at(symbol, sl_side, stop_price)
+    # Idempotency pre-check: if a closePosition SL already sits at the target
+    # price, skip cancel+place. Type-aware so a stale reduceOnly order at the
+    # same price doesn't false-positive the check.
+    existing_id = _sl_already_at(
+        symbol, sl_side, stop_price, expected_type="closePosition"
+    )
     if existing_id:
         log.info(
-            f"{symbol} SL already at target {stop_price} — skipping replace (id={existing_id})"
+            f"{symbol} closePosition SL already at target {stop_price} — skipping replace (id={existing_id})"
         )
         return {"success": True, "sl_order_id": existing_id, "error": None}
 
@@ -842,10 +962,13 @@ def _place_closeposition_sl_with_retry(
             # declaring success. create_order's response can lead the order-list
             # by hundreds of ms; without this check, the caller may trust a
             # success flag that's not yet reflected on the exchange.
-            if not _verify_sl_placed(symbol, sl_side, stop_price):
+            # Type-aware so we don't confirm a stale reduceOnly at same price.
+            if not _verify_sl_placed(
+                symbol, sl_side, stop_price, expected_type="closePosition"
+            ):
                 last_err = Exception(
                     f"closePosition SL placement returned id={order_id} but "
-                    f"verification poll found no STOP_MARKET at {stop_price}"
+                    f"verification poll found no closePosition STOP_MARKET at {stop_price}"
                 )
                 log.error(str(last_err))
                 if attempt < max_attempts:
@@ -873,6 +996,7 @@ def _place_closeposition_sl_with_retry(
                     f"existing closePosition SL still registered server-side. "
                     f"Backing off {backoff:.1f}s and retrying."
                 )
+                _dump_open_orders_on_4130(symbol, "closePosition path")
                 time.sleep(backoff)
                 continue
             # Non-retryable error, or all retries exhausted
@@ -916,11 +1040,14 @@ def _place_reduceonly_sl_with_retry(
     result: dict = {"success": False, "sl_order_id": None, "error": None}
     last_err: Optional[Exception] = None
 
-    # Idempotency pre-check
-    existing_id = _sl_already_at(symbol, sl_side, stop_price)
+    # Idempotency pre-check — reduceOnly only, so stale closePosition at same
+    # price doesn't false-positive and skip the placement we actually want.
+    existing_id = _sl_already_at(
+        symbol, sl_side, stop_price, expected_type="reduceOnly"
+    )
     if existing_id:
         log.info(
-            f"{symbol} SL already at target {stop_price} — skipping replace (id={existing_id})"
+            f"{symbol} reduceOnly SL already at target {stop_price} — skipping replace (id={existing_id})"
         )
         return {"success": True, "sl_order_id": existing_id, "error": None}
 
@@ -955,10 +1082,13 @@ def _place_reduceonly_sl_with_retry(
             # open orders before declaring success. Without this, a race where
             # create_order succeeds but order-list lookup fails leaves the bot
             # trusting a non-existent SL and the position effectively naked.
-            if not _verify_sl_placed(symbol, sl_side, stop_price):
+            # Type-aware to reject stale closePosition at same price.
+            if not _verify_sl_placed(
+                symbol, sl_side, stop_price, expected_type="reduceOnly"
+            ):
                 last_err = Exception(
                     f"reduceOnly SL placement returned id={order_id} but "
-                    f"verification poll found no STOP_MARKET at {stop_price}"
+                    f"verification poll found no reduceOnly STOP_MARKET at {stop_price}"
                 )
                 log.error(str(last_err))
                 if attempt < max_attempts:
@@ -995,6 +1125,7 @@ def _place_reduceonly_sl_with_retry(
                     f"{symbol} reduceOnly SL hit -4130 on attempt {attempt} — "
                     f"backing off {backoff:.1f}s and retrying."
                 )
+                _dump_open_orders_on_4130(symbol, "reduceOnly path")
                 time.sleep(backoff)
                 continue
             log.error(
