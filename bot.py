@@ -57,12 +57,12 @@ class Cfg:
     ATR_P       = 14
 
     # ── Entry filters ─────────────────────────────────────────────
-    PULL_PCT    = 0.005       # v5: 0.5% pull-back zone (was 0.8%) — tighter = better edge
+    PULL_PCT    = 0.012       # v6: 1.2% pull-back zone (was 0.5%) — wider zone catches more setups
     RSI_LO      = 45          # v3: long when RSI < 45 (was 40)
     RSI_HI      = 60          # v3: short when RSI > 60 (unchanged)
     RSI_FLOOR   = 25.0
     RSI_CEIL    = 75.0
-    ATR_REL     = 0.70        # v4: 0.70x avg (was 0.90x) - more valid setups
+    ATR_REL     = 0.55        # v6: 0.55x avg (was 0.70x) — less aggressive chop filter
     ATR_AVG_N   = 100
 
     # ── Session filter (v5 EXPANDED) ─────────────────────────────
@@ -310,7 +310,7 @@ def fresh_state():
     """Create a fresh bot state dictionary."""
     return {
         "capital": Cfg.IC, "peak": Cfg.IC,
-        "checks": 0, "signals": 0, "chops": 0,
+        "checks": 0, "signals": 0, "chops": 0, "watches": 0,
         "start_px": {},
         "started_at": datetime.now(timezone.utc).isoformat(),
         "open_trades": {},
@@ -327,6 +327,7 @@ def load_state():
             if "open_trades" not in s: s["open_trades"] = {}
             if "pair_stats"  not in s: s["pair_stats"]  = {p: {"trades":0,"wins":0,"pnl":0.0} for p in PAIRS}
             if "circuit_breaker" not in s: s["circuit_breaker"] = {}
+            if "watches"         not in s: s["watches"]         = 0
             return s
     except Exception as e:
         log.warning(f"Could not load state: {e}")
@@ -475,11 +476,11 @@ def get_signal(d5, capital):
     rsi_fall  = d5["rsi_falling"][i]
 
     m = {"px":c,"e21":d5["e21"][i],"rsi":rc,"atr":atr_val,
-         "ar":ar,"hour":hour,"rsi_1h":rsi_1h}
+         "ar":ar,"hour":hour,"rsi_1h":rsi_1h,"dist":dist}  # dist added for log display
 
     # ── Chop filter ──────────────────────────────────────────────
     if ar is None or ar < Cfg.ATR_REL:
-        return {"sig": "CHOP", "reason": f"ATR {ar:.2f}x" if ar else "ATR N/A", "m": m}
+        return {"sig": "CHOP", "reason": f"ATR {ar:.2f}x<{Cfg.ATR_REL:.2f}x" if ar else "ATR N/A", "m": m}
 
     # ── Session filter (v3) ──────────────────────────────────────
     if not (Cfg.SESSION_START <= hour < Cfg.SESSION_END):
@@ -497,14 +498,36 @@ def get_signal(d5, capital):
     tr_d = "UP" if d5["tf_up"][i] else ("DOWN" if d5["tf_dn"][i] else "FLAT")
     m["tr"] = tr_d  # expose 15M trend to log display (was missing — caused 15M:? in logs)
 
+    # ── Gate-by-gate evaluation (v6 verbose diagnostics) ─────────
+    # v6 RSI change: zone-based instead of single-bar cross.
+    # Old LONG: rp < RSI_LO AND rc > rp  (exact cross-bar — rarely fires)
+    # New LONG: rc < RSI_LO+5 AND rsi_rise  (RSI in pullback zone AND rising)
+    # Old SHORT: rp > RSI_HI AND rc < rp  (exact cross-bar)
+    # New SHORT: rc > RSI_HI-5 AND rsi_fall  (RSI in overbought zone AND falling)
+    rsi_1h_ok_long  = rsi_1h is None or rsi_1h > Cfg.RSI_1H_LO
+    rsi_1h_ok_short = rsi_1h is None or rsi_1h < Cfg.RSI_1H_HI
+
+    lg = {
+        "15M-UP":                        d5["tf_up"][i],
+        f"dist<{Cfg.PULL_PCT*100:.1f}%": near,
+        f"RSI<{Cfg.RSI_LO+5:.0f}":       rc < Cfg.RSI_LO + 5,
+        f"RSI>fl{Cfg.RSI_FLOOR:.0f}":    rc > Cfg.RSI_FLOOR,
+        "bull-body":                     bull,
+        "rsi-rising":                    rsi_rise,
+        f"1H>{Cfg.RSI_1H_LO:.0f}":       rsi_1h_ok_long,
+    }
+    sg = {
+        "15M-DN":                        d5["tf_dn"][i],
+        f"dist<{Cfg.PULL_PCT*100:.1f}%": near,
+        f"RSI>{Cfg.RSI_HI-5:.0f}":       rc > Cfg.RSI_HI - 5,
+        f"RSI<cl{Cfg.RSI_CEIL:.0f}":     rc < Cfg.RSI_CEIL,
+        "bear-body":                     bear,
+        "rsi-falling":                   rsi_fall,
+        f"1H<{Cfg.RSI_1H_HI:.0f}":       rsi_1h_ok_short,
+    }
+
     # ── LONG signal ──────────────────────────────────────────────
-    if (d5["tf_up"][i]
-            and near
-            and rp < Cfg.RSI_LO and rc > rp       # RSI turning up from below 45
-            and rc > Cfg.RSI_FLOOR
-            and bull
-            and rsi_rise                             # v3: RSI rising 2 bars
-            and (rsi_1h is None or rsi_1h > Cfg.RSI_1H_LO)):  # v3: 1H filter
+    if all(lg.values()):
         sl  = c - atr_val * Cfg.SL_MULT
         tp1 = c + atr_val * Cfg.TP1_MULT
         tp2 = c + atr_val * Cfg.TP2_MULT
@@ -526,18 +549,12 @@ def get_signal(d5, capital):
             )
             sz = _max_sz
         return {"sig": "LONG",
-                "reason": f"15M-UP EMA+RSI {rp:.0f}→{rc:.0f}",
+                "reason": f"15M-UP EMA+RSI {rp:.0f}→{rc:.0f} zone",
                 "m": m, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
                 "be": be, "sz": sz, "atr": atr_val}
 
     # ── SHORT signal ─────────────────────────────────────────────
-    if (d5["tf_dn"][i]
-            and near
-            and rp > Cfg.RSI_HI and rc < rp        # RSI turning down from above 60
-            and rc < Cfg.RSI_CEIL
-            and bear
-            and rsi_fall                             # v3: RSI falling 2 bars
-            and (rsi_1h is None or rsi_1h < Cfg.RSI_1H_HI)):  # v3: 1H filter
+    if all(sg.values()):
         sl  = c + atr_val * Cfg.SL_MULT
         tp1 = c - atr_val * Cfg.TP1_MULT
         tp2 = c - atr_val * Cfg.TP2_MULT
@@ -556,15 +573,14 @@ def get_signal(d5, capital):
             )
             sz = _max_sz
         return {"sig": "SHORT",
-                "reason": f"15M-DOWN EMA+RSI {rp:.0f}→{rc:.0f}",
+                "reason": f"15M-DOWN EMA+RSI {rp:.0f}→{rc:.0f} zone",
                 "m": m, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
                 "be": be, "sz": sz, "atr": atr_val}
 
-    reason = f"15M:{tr_d}"
-    if not near: reason += f" | dist {dist*100:.3f}%"
-    else:        reason += f" | RSI:{rc:.0f}"
-    if not (Cfg.SESSION_START <= hour < Cfg.SESSION_END):
-        reason += f" | off-session"
+    # ── WATCH: show every failed gate for live diagnostics ───────
+    l_fails = [k for k, v in lg.items() if not v]
+    s_fails = [k for k, v in sg.items() if not v]
+    reason  = f"LONG[{','.join(l_fails)}] SHORT[{','.join(s_fails)}]"
     return {"sig": "WATCH", "reason": reason, "m": m}
 
 
@@ -724,7 +740,7 @@ def tg_heartbeat(S):
         f"uPnL    : ${upnl:+,.2f}",
         f"Booked  : ${S['capital']:,.2f}   (closed P&L)",
         f"MaxDD   : {mdd:.1f}%",
-        f"Trades  : {len(S['trades'])} | Signals:{S['signals']} | Chops:{S['chops']}",
+        f"Trades  : {len(S['trades'])} | Signals:{S['signals']} | Chops:{S['chops']} | Watches:{S.get('watches',0)}",
         ""
     ]
     for sym in PAIRS:
@@ -1290,9 +1306,12 @@ def main():
                         m      = result.get("m", {})
                         log.info(f"{sym} ${px:,.2f} | 15M:{m.get('tr','?')} | "
                                  f"RSI:{m.get('rsi',0):.1f} | ATR:{m.get('ar',0):.2f}x | "
-                                 f"Dist:{m.get('dist',0)*100:.3f}% | Hr:{m.get('hour','?')} | {sig}")
+                                 f"Dist:{m.get('dist',0)*100:.3f}% | Hr:{m.get('hour','?')} | "
+                                 f"{sig}: {result.get('reason','')}")
                         if sig == "CHOP":
                             S["chops"] += 1
+                        elif sig == "WATCH":
+                            S["watches"] = S.get("watches", 0) + 1
                         elif sig in ("LONG","SHORT"):
                             if executor.circuit_breaker.is_tripped():
                                 # 🔴 RISK: CB active — block entry (trip already logged)
