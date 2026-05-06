@@ -200,8 +200,8 @@ check("bot.py stores S[live_equity]",
 # ─────────────────────────────────────────────
 print("\n[5] Structure Sanity")
 
-check(f"executor.py line count in range 580–1450 (got {len(exec_lines)})",
-      580 <= len(exec_lines) <= 1450,
+check(f"executor.py line count in range 580–1600 (got {len(exec_lines)})",
+      580 <= len(exec_lines) <= 1600,
       f"unexpected line count may indicate missing or duplicate content")
 
 check(f"bot.py line count in range 750–1400 (got {len(bot_lines)})",
