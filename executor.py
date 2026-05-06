@@ -161,12 +161,30 @@ def _round_qty(symbol: str, qty: float) -> float:
 
 
 def _round_price(symbol: str, price: float) -> float:
-    """Round price to exchange tick size precision."""
+    """Round price to exchange tick size using ccxt's price_to_precision.
+
+    🔴 FIX ('verify-fail'): the prior implementation read
+    `precision = market.get('precision', {}).get('price', 8)` and computed
+    `factor = 10 ** precision`. That worked when CCXT reported `precision.price`
+    as an integer digit count, but BROKE in two scenarios:
+
+      1. CCXT in TICK_SIZE mode returns a float (e.g. 0.10 for BTCUSDT).
+         `10 ** 0.10 = 1.2589` → garbage rounding (price snapped to wrong tick).
+      2. `precision.price` missing entirely → fallback `8` → `factor = 1e8`,
+         essentially no rounding. Binance accepts the unrounded value, silently
+         snaps to the real tick, but `_verify_sl_placed` then fails to match
+         the snapped price → emergency-close on a legitimately placed SL.
+
+    `ex.price_to_precision()` queries the same market metadata but uses CCXT's
+    internal precision-mode logic (TICK_SIZE vs DECIMAL_PLACES vs SIGNIFICANT_DIGITS)
+    and returns a string already aligned to the exchange's tick. We cast back
+    to float for downstream consumers that expect numeric type.
+
+    Accepts both bot-format ("BTCUSDT") and CCXT-format ("BTC/USDT:USDT") symbols.
+    """
     ex = _get_exchange()
-    market = ex.market(symbol)
-    precision = market.get("precision", {}).get("price", 8)
-    factor = 10 ** precision
-    return round(price * factor) / factor
+    ccxt_sym = symbol if "/" in symbol else _symbol_to_ccxt(symbol)
+    return float(ex.price_to_precision(ccxt_sym, price))
 
 
 def _symbol_to_ccxt(symbol: str) -> str:
@@ -756,10 +774,26 @@ def _dump_open_orders_on_4130(symbol: str, ctx: str) -> None:
 
 
 def _is_truthy_flag(v) -> bool:
-    """Coerce Binance/CCXT info-dict flag to bool. Handles True, 'true', 'True'."""
+    """Coerce Binance/CCXT info-dict flag to bool.
+
+    Accepts the JSON shapes Binance is observed to return for boolean fields:
+      - Python bool True
+      - int/float 1 (rare but possible across CCXT versions)
+      - string "true" / "True" / "TRUE" (case-insensitive, whitespace-trimmed)
+      - string "1"
+
+    Anything else (False, 0, "false", None, missing) → False.
+
+    🔴 FIX ('verify-fail'): the prior implementation only matched True and
+    "true". When Binance/CCXT returned reduceOnly as int 1 or string "1",
+    the verify match would silently fail → bot would emergency-close a
+    legitimately-placed SL.
+    """
     if v is True:
         return True
-    if isinstance(v, str) and v.strip().lower() == "true":
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and v == 1:
+        return True
+    if isinstance(v, str) and v.strip().lower() in ("true", "1"):
         return True
     return False
 
@@ -851,10 +885,11 @@ def _verify_sl_placed(
     symbol: str,
     sl_side: str,
     target_px: float,
-    tol_pct: float = 0.1,
-    max_polls: int = 4,
-    poll_delay: float = 0.4,
+    tol_pct: float = 0.2,
+    max_polls: int = 10,
+    poll_delay: float = 0.5,
     expected_type: Optional[str] = None,
+    expected_id: Optional[str] = None,
 ) -> bool:
     """Verify a STOP_MARKET of expected_type exists at target_px (±tol_pct %) for sl_side.
 
@@ -868,10 +903,49 @@ def _verify_sl_placed(
     verification when a stale closePosition order matches a fresh reduceOnly
     placement at the same price (or vice versa).
 
+    🔴 FIX ('verify-fail' Fix 2): when caller passes expected_id (the id
+    returned from create_order), we scan open_orders by id FIRST. Direct
+    id-match is exchange-authoritative — eliminates the brittle reconstruct-
+    and-match path (price tolerance, type-flag truthy quirks) that produced
+    false negatives. Falls back to legacy price+type match if id-match
+    misses (handles the rare case where id is present but Binance hasn't
+    populated reduceOnly flag yet, etc).
+
+    🔴 FIX ('verify-fail' Fix 4+5): defaults bumped from
+    (max_polls=4, poll_delay=0.4, tol_pct=0.1) → (10, 0.5, 0.2).
+    New budget: 5s total. Adequate for Binance order-list propagation lag
+    under load. Wider tolerance absorbs any residual rounding asymmetry
+    between the placed price and the value Binance reports back.
+
     Polls fetch_open_orders up to `max_polls` times, sleeping `poll_delay`
     seconds between polls. Returns True if confirmed; False otherwise.
     """
+    ex = _get_exchange()
+    ccxt_sym = _symbol_to_ccxt(symbol)
     for i in range(max_polls):
+        # Fast path: scan by exact order id when caller provides it.
+        if expected_id:
+            try:
+                for o in ex.fetch_open_orders(ccxt_sym):
+                    if str(o.get("id")) == str(expected_id):
+                        if _order_matches_type(o, expected_type):
+                            log.info(
+                                f"{symbol} SL verified by id={expected_id} "
+                                f"after {i+1} poll(s) (type={expected_type or 'any'})"
+                            )
+                            return True
+                        else:
+                            # Order exists with the right id but wrong type
+                            # (extremely unlikely but defensible — fall through
+                            # to price-match in case the type-flag is stale).
+                            log.warning(
+                                f"{symbol} order id={expected_id} exists but "
+                                f"type filter rejected — falling through to price match"
+                            )
+                            break
+            except Exception as e:
+                log.warning(f"{symbol} verify by-id scan failed: {e}")
+        # Legacy path: price + type-flag match within tolerance.
         existing_id = _sl_already_at(
             symbol, sl_side, target_px, tol_pct, expected_type=expected_type
         )
@@ -884,9 +958,48 @@ def _verify_sl_placed(
         time.sleep(poll_delay)
     log.error(
         f"{symbol} SL verification FAILED — no STOP_MARKET ({expected_type or 'any'}) "
-        f"found at {target_px} after {max_polls} polls (tol {tol_pct}%)"
+        f"found at {target_px} after {max_polls} polls (tol {tol_pct}%, "
+        f"expected_id={expected_id or 'none'})"
     )
     return False
+
+
+def _diagnose_sl_verify_fail(symbol: str, order_id: str) -> dict:
+    """Fetch a specific order by id and dump its actual state to logs.
+
+    Called when `_verify_sl_placed` returned False even though create_order
+    returned a valid id. The order may be:
+      - status="closed" / "filled" → SL triggered between placement and verify
+        (price moved through stop in 1-5s). Position is already closed by SL.
+        Helper should NOT emergency-close again.
+      - status="canceled" → Binance silently rejected after ack (e.g. invalid
+        tick, margin issue post-fill). Helper should retry placement.
+      - status="open" but reduceOnly/closePosition flag mismatched → defensive
+        log to help diagnose Fix C/Fix 6 edge cases.
+      - fetch_order itself fails → log + return empty dict; helper proceeds
+        with normal retry (no false-positive success).
+
+    Returns the order dict (unified CCXT shape) on success, empty dict on failure.
+    """
+    try:
+        ex = _get_exchange()
+        ccxt_sym = _symbol_to_ccxt(symbol)
+        o = ex.fetch_order(order_id, ccxt_sym) or {}
+        info = o.get("info", {}) or {}
+        log.error(
+            f"{symbol} verify-fail diag: id={order_id} "
+            f"status={o.get('status')!r} "
+            f"filled={o.get('filled')}/{o.get('amount')} "
+            f"stopPrice={info.get('stopPrice')!r} "
+            f"reduceOnly={info.get('reduceOnly')!r} "
+            f"closePosition={info.get('closePosition')!r} "
+            f"type={info.get('type')!r} "
+            f"positionSide={info.get('positionSide')!r}"
+        )
+        return o
+    except Exception as e:
+        log.error(f"{symbol} verify-fail diag — fetch_order({order_id}) failed: {e}")
+        return {}
 
 
 def _place_closeposition_sl_with_retry(
@@ -963,9 +1076,31 @@ def _place_closeposition_sl_with_retry(
             # by hundreds of ms; without this check, the caller may trust a
             # success flag that's not yet reflected on the exchange.
             # Type-aware so we don't confirm a stale reduceOnly at same price.
+            # 🔴 FIX ('verify-fail' Fix 2): pass expected_id for direct id-match.
             if not _verify_sl_placed(
-                symbol, sl_side, stop_price, expected_type="closePosition"
+                symbol, sl_side, stop_price,
+                expected_type="closePosition",
+                expected_id=order_id,
             ):
+                # 🔴 FIX ('verify-fail' Fix 3): diag fetch_order to detect
+                # instant-fill (status=filled/closed). If SL triggered between
+                # placement and verify, position is closed — don't retry,
+                # don't emergency-close again, just declare success.
+                diag = _diagnose_sl_verify_fail(symbol, order_id)
+                diag_status = (diag.get("status") or "").lower()
+                if diag_status in ("filled", "closed"):
+                    log.warning(
+                        f"{symbol} closePosition SL order {order_id} ALREADY "
+                        f"FILLED — stop triggered between placement and verify. "
+                        f"Position already closed. Treating as success."
+                    )
+                    result.update({
+                        "success": True,
+                        "sl_order_id": order_id,
+                        "error": None,
+                        "filled_at_placement": True,
+                    })
+                    return result
                 last_err = Exception(
                     f"closePosition SL placement returned id={order_id} but "
                     f"verification poll found no closePosition STOP_MARKET at {stop_price}"
@@ -1083,14 +1218,53 @@ def _place_reduceonly_sl_with_retry(
             # create_order succeeds but order-list lookup fails leaves the bot
             # trusting a non-existent SL and the position effectively naked.
             # Type-aware to reject stale closePosition at same price.
+            # 🔴 FIX ('verify-fail' Fix 2): pass expected_id for direct id-match.
             if not _verify_sl_placed(
-                symbol, sl_side, stop_price, expected_type="reduceOnly"
+                symbol, sl_side, stop_price,
+                expected_type="reduceOnly",
+                expected_id=order_id,
             ):
+                # 🔴 FIX ('verify-fail' Fix 3): diag fetch_order to find out
+                # WHY verify failed. If status is filled/closed, the SL
+                # already triggered between placement and verify (instant fill
+                # near stop) — position is closed; do NOT emergency-close
+                # AGAIN, just declare success.
+                diag = _diagnose_sl_verify_fail(symbol, order_id)
+                diag_status = (diag.get("status") or "").lower()
+                if diag_status in ("filled", "closed"):
+                    log.warning(
+                        f"{symbol} SL order {order_id} ALREADY FILLED — stop "
+                        f"triggered between placement and verify. Position "
+                        f"already closed by SL. Treating as success."
+                    )
+                    result.update({
+                        "success": True,
+                        "sl_order_id": order_id,
+                        "error": None,
+                        "filled_at_placement": True,
+                    })
+                    return result
                 last_err = Exception(
                     f"reduceOnly SL placement returned id={order_id} but "
                     f"verification poll found no reduceOnly STOP_MARKET at {stop_price}"
                 )
                 log.error(str(last_err))
+                # 🔴 FIX ('verify-fail' Fix 7): inner cross-fallback — after
+                # 2nd verify-fail (and not -4130), switch to closePosition
+                # path inside the helper. Saves ~5-8s vs waiting for outer
+                # cross-fallback in open_position. -4130 path stays on its
+                # own retry/backoff because closePosition can't help with -4130.
+                if attempt >= 2 and "4130" not in str(last_err):
+                    log.warning(
+                        f"{symbol} reduceOnly verify-fail twice — switching to "
+                        f"closePosition inside helper to save round-trip."
+                    )
+                    return _place_closeposition_sl_with_retry(
+                        symbol=symbol,
+                        sl_side=sl_side,
+                        stop_price=stop_price,
+                        qty=qty,
+                    )
                 if attempt < max_attempts:
                     time.sleep(max(2.5, 2.0 * attempt))
                     continue
