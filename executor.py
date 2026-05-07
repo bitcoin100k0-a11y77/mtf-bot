@@ -431,23 +431,46 @@ def open_position(
     # Cancel was already run inside the failed primary helper so no orphan
     # orders remain. Cross-helper attempt is independent. Cheaper than
     # eating fees on emergency rollback.
+    #
+    # 🔴 FIX (v3 Fix 3): SKIP closePosition fallback when:
+    #   (a) last error contains -4130 → closePosition will fail with the SAME
+    #       -4130 error. Don't burn 2 attempts + ~6s of latency for nothing.
+    #   (b) error is verify-related AND we have a sl_order_id → reduceOnly may
+    #       actually be placed server-side. Falling back would cancel it via
+    #       the closePosition helper's cancel_open_orders() at start. Don't
+    #       destroy our own working SL. (Fix 2 v3 above already handles the
+    #       common "order exists, verify missed" case via diag-status, but
+    #       this is the safety net for any remaining edge cases.)
     if not sl_result["success"]:
-        log.warning(
-            f"{symbol} primary SL path failed: {sl_result['error']} "
-            f"— attempting closePosition fallback"
+        err_str = sl_result.get("error", "") or ""
+        skip_cp_fallback = (
+            "4130" in err_str
+            or ("verification poll" in err_str and sl_result.get("sl_order_id"))
         )
-        fallback = _place_closeposition_sl_with_retry(
-            symbol=symbol,
-            sl_side=sl_side,
-            stop_price=sl_px,
-            qty=fill_qty,
-            max_attempts=2,
-        )
-        if fallback["success"]:
-            log.info(
-                f"{symbol} closePosition fallback SUCCEEDED — entry protected"
+        if skip_cp_fallback:
+            reason = "-4130 conflict" if "4130" in err_str else "order may exist server-side"
+            log.warning(
+                f"{symbol} skipping closePosition fallback — "
+                f"won't help (reason: {reason}). "
+                f"primary error: {err_str}"
             )
-            sl_result = fallback
+        else:
+            log.warning(
+                f"{symbol} primary SL path failed: {sl_result['error']} "
+                f"— attempting closePosition fallback"
+            )
+            fallback = _place_closeposition_sl_with_retry(
+                symbol=symbol,
+                sl_side=sl_side,
+                stop_price=sl_px,
+                qty=fill_qty,
+                max_attempts=2,
+            )
+            if fallback["success"]:
+                log.info(
+                    f"{symbol} closePosition fallback SUCCEEDED — entry protected"
+                )
+                sl_result = fallback
 
     if sl_result["success"]:
         result["sl_order_id"] = sl_result["sl_order_id"]
@@ -956,6 +979,24 @@ def _verify_sl_placed(
             )
             return True
         time.sleep(poll_delay)
+    # 🔴 FIX (v3 Fix 5): direct fetch_order rescue. open_orders list can lag
+    # the order's actual state by seconds under load. fetch_order(id) is
+    # authoritative — if Binance has the order with active status, return
+    # True. Saves the diag/recovery path in the caller. Only runs once,
+    # only when we have an expected_id, only at end of loop (cheap insurance).
+    if expected_id:
+        try:
+            ex2 = _get_exchange()
+            o = ex2.fetch_order(expected_id, ccxt_sym) or {}
+            status = (o.get("status") or "").lower()
+            if status in ("open", "new", "untriggered", "active"):
+                log.info(
+                    f"{symbol} SL verified by direct fetch_order id={expected_id} "
+                    f"(status={status}) — open_orders list lagging"
+                )
+                return True
+        except Exception as fe:
+            log.warning(f"{symbol} fetch_order direct lookup failed: {fe}")
     log.error(
         f"{symbol} SL verification FAILED — no STOP_MARKET ({expected_type or 'any'}) "
         f"found at {target_px} after {max_polls} polls (tol {tol_pct}%, "
@@ -1042,6 +1083,45 @@ def _place_closeposition_sl_with_retry(
         )
         return {"success": True, "sl_order_id": existing_id, "error": None}
 
+    # 🔴 FIX (v3 Fix 4): preemptive stale-closePosition cleanup. -4130 fires
+    # for ANY existing closePosition stop in our direction (filtered by
+    # positionSide in hedge mode). The atomic cancel_all_orders inside the
+    # retry loop is supposed to clear them, but Binance's -4130 tracker has
+    # been observed to lag the open-orders list by 1-3s under load. Find
+    # them explicitly and cancel by id with a longer flush wait BEFORE the
+    # placement loop. Filter strict so we never touch orders for the
+    # opposite direction or non-closePosition orders.
+    try:
+        target_pos_side = _position_side_for("LONG" if sl_side == "sell" else "SHORT")
+        open_orders = ex.fetch_open_orders(ccxt_sym)
+        stale_cp = []
+        for o in open_orders:
+            info = o.get("info") or {}
+            if not _is_truthy_flag(info.get("closePosition")):
+                continue
+            if (o.get("side") or "").lower() != sl_side.lower():
+                continue
+            if target_pos_side and info.get("positionSide") != target_pos_side:
+                continue
+            stale_cp.append(o)
+        if stale_cp:
+            log.warning(
+                f"{symbol} found {len(stale_cp)} stale closePosition order(s) — "
+                f"explicit cancel before placement attempt "
+                f"(side={sl_side}, positionSide={target_pos_side or 'one-way'})"
+            )
+            for o in stale_cp:
+                try:
+                    ex.cancel_order(o["id"], ccxt_sym)
+                    log.info(f"cancelled stale closePosition id={o.get('id')}")
+                except Exception as ce:
+                    log.warning(f"failed cancel stale id={o.get('id')}: {ce}")
+            # Tracker-flush wait — longer than min_wait_after_cancel because
+            # -4130 tracker observed up to ~3s under load.
+            time.sleep(3.0)
+    except Exception as pre_e:
+        log.warning(f"{symbol} stale-cp pre-cleanup skipped: {pre_e}")
+
     for attempt in range(1, max_attempts + 1):
         cancelled_clean = cancel_open_orders(symbol)
         # ALWAYS wait — even when cancel verified clean.
@@ -1099,6 +1179,24 @@ def _place_closeposition_sl_with_retry(
                         "sl_order_id": order_id,
                         "error": None,
                         "filled_at_placement": True,
+                    })
+                    return result
+                # 🔴 FIX (v3 Fix 2): order exists with active status — verify
+                # heuristic just missed it. Trust the id. Order is on Binance.
+                if diag_status in ("open", "new", "untriggered", "active"):
+                    info = diag.get("info") or {}
+                    log.warning(
+                        f"{symbol} closePosition SL order {order_id} EXISTS "
+                        f"server-side (status={diag_status}) but verify "
+                        f"heuristic missed it. Trusting id. "
+                        f"closePosition={info.get('closePosition')!r} "
+                        f"stopPrice={info.get('stopPrice')!r}"
+                    )
+                    result.update({
+                        "success": True,
+                        "sl_order_id": order_id,
+                        "error": None,
+                        "verify_recovered": True,
                     })
                     return result
                 last_err = Exception(
@@ -1244,27 +1342,41 @@ def _place_reduceonly_sl_with_retry(
                         "filled_at_placement": True,
                     })
                     return result
+                # 🔴 FIX (v3 Fix 2): order exists with active status — verify
+                # just couldn't find it via heuristic match. Trust the id.
+                # Order is on Binance, position protected. This is the path
+                # that was incorrectly triggering Fix 7 self-destruct before.
+                if diag_status in ("open", "new", "untriggered", "active"):
+                    info = diag.get("info") or {}
+                    log.warning(
+                        f"{symbol} SL order {order_id} EXISTS server-side "
+                        f"(status={diag_status}) but verify heuristic missed it. "
+                        f"Trusting id. reduceOnly={info.get('reduceOnly')!r} "
+                        f"closePosition={info.get('closePosition')!r} "
+                        f"stopPrice={info.get('stopPrice')!r}"
+                    )
+                    result.update({
+                        "success": True,
+                        "sl_order_id": order_id,
+                        "error": None,
+                        "verify_recovered": True,
+                    })
+                    return result
                 last_err = Exception(
                     f"reduceOnly SL placement returned id={order_id} but "
                     f"verification poll found no reduceOnly STOP_MARKET at {stop_price}"
                 )
                 log.error(str(last_err))
-                # 🔴 FIX ('verify-fail' Fix 7): inner cross-fallback — after
-                # 2nd verify-fail (and not -4130), switch to closePosition
-                # path inside the helper. Saves ~5-8s vs waiting for outer
-                # cross-fallback in open_position. -4130 path stays on its
-                # own retry/backoff because closePosition can't help with -4130.
-                if attempt >= 2 and "4130" not in str(last_err):
-                    log.warning(
-                        f"{symbol} reduceOnly verify-fail twice — switching to "
-                        f"closePosition inside helper to save round-trip."
-                    )
-                    return _place_closeposition_sl_with_retry(
-                        symbol=symbol,
-                        sl_side=sl_side,
-                        stop_price=stop_price,
-                        qty=qty,
-                    )
+                # 🔴 FIX (v3) — Fix 7 (inner cross-fallback) REMOVED.
+                # Previously: after 2nd verify-fail, switched to closePosition.
+                # That path's cancel_open_orders() killed the reduceOnly SL we
+                # just placed (Binance returned a real id; order existed). Then
+                # closePosition placement hit -4130 from a separate stale-state
+                # issue and 5 retries failed. Net: working SL destroyed,
+                # position emergency-closed. The diag-status branch above (Fix
+                # 2 v3) now rescues the legitimate "order exists, verify just
+                # missed it" case directly. Outer fallback in open_position
+                # still handles genuine reduceOnly placement failures.
                 if attempt < max_attempts:
                     time.sleep(max(2.5, 2.0 * attempt))
                     continue
