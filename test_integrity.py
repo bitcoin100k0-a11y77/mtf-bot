@@ -308,6 +308,25 @@ check("v5 Fix H: bot.py calls _final_sl_lost_check on grace-end + unknown",
       "bot must demand positive evidence before emergency-closing on 'unknown'")
 
 # ─────────────────────────────────────────────
+# v6 Fix I — kill UNVERIFIED alert at the source (skip-verify-on-NEW)
+# ─────────────────────────────────────────────
+check("v6 Fix I: closePosition path has fast-path skip-verify",
+      exec_src.count("fast-path skip verify") >= 2,
+      "both placement helpers must short-circuit verify when create_order acks NEW/ACCEPTED")
+
+check("v6 Fix I: fast_path marker flag returned from helpers",
+      exec_src.count('"fast_path": True') >= 2,
+      "both placement helpers must surface fast_path=True so bot.py can tighten cadence")
+
+check("v6 Fix I: bot.py reads fast_path to tighten first re-verify cadence",
+      "fast_path" in bot_src and "+20s" in bot_src,
+      "execute_entry must tighten first re-verify to 20s on fast-path trades")
+
+check("v6 Fix I: tg_sl_unverified call-sites unchanged (fast-path adds none)",
+      exec_src.count("tg_sl_unverified(symbol") == 2,
+      "exactly 2 call-sites must remain — one per placement helper's empty-status fallback")
+
+# ─────────────────────────────────────────────
 # 6. STRUCTURE SANITY
 # ─────────────────────────────────────────────
 print("\n[5] Structure Sanity")
