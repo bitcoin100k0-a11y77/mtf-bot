@@ -196,16 +196,97 @@ check("bot.py stores S[live_equity]",
       "live_equity" in bot_src)
 
 # ─────────────────────────────────────────────
+# 5b. v4 SL VERIFY-FAIL FIXES (Fix A through Fix G)
+# ─────────────────────────────────────────────
+print("\n[4b] v4 SL verify-fail fixes")
+
+# Fix A — trust-id branch in BOTH retry helpers (count must be >=2)
+check("v4 Fix A: TRUSTING id present in BOTH executor helpers",
+      exec_src.count("TRUSTING id") >= 2,
+      "trust-id rescue path must exist in reduceOnly + closePosition helpers")
+
+check("v4 Fix A: sl_unverified flag set in executor",
+      "sl_unverified" in exec_src and '"sl_unverified": True' in exec_src,
+      "executor must mark sl_unverified=True on trust-id rescue")
+
+check("v4 Fix A: sl_unverified propagated through open_position",
+      'result["sl_unverified"] = True' in exec_src,
+      "open_position must propagate sl_unverified to caller")
+
+# Fix B — diag wrapped in try/except (count must be >=2)
+check("v4 Fix B: diag wrapped in try/except in BOTH helpers",
+      exec_src.count("diag raised") >= 2,
+      "_diagnose_sl_verify_fail call must be try-wrapped in both retry helpers")
+
+# Fix C — verify defaults bumped
+check("v4 Fix C: max_polls=15 default in _verify_sl_placed",
+      "max_polls: int = 15" in exec_src,
+      "verify budget must be 15 polls")
+
+check("v4 Fix C: poll_delay=0.6 default in _verify_sl_placed",
+      "poll_delay: float = 0.6" in exec_src,
+      "verify poll delay must be 0.6s")
+
+# Fix D — extended diag telemetry
+check("v4 Fix D: clientId in diag log",
+      "clientId={info.get('clientOrderId')" in exec_src,
+      "diag must log clientOrderId for next-failure debugging")
+
+check("v4 Fix D: status_raw in diag log",
+      "status_raw=" in exec_src,
+      "diag must log raw Binance status alongside ccxt unified status")
+
+# new public verify_existing_sl helper
+check("v4: verify_existing_sl public helper defined",
+      "def verify_existing_sl" in exec_src,
+      "public re-verify helper required for bot.py Fix F deferred check")
+
+# Fix E — telegram helpers
+check("v4 Fix E: tg_sl_unverified defined in bot.py",
+      "def tg_sl_unverified" in bot_src,
+      "Telegram alert for trust-id path must exist")
+
+check("v4 Fix E: tg_sl_resolved defined in bot.py",
+      "def tg_sl_resolved" in bot_src,
+      "Telegram alert for resolved trust-id must exist")
+
+check("v4 Fix E: tg_sl_lost defined in bot.py",
+      "def tg_sl_lost" in bot_src,
+      "Telegram alert for lost SL must exist")
+
+# Fix F — 60s re-verify in main loop
+check("v4 Fix F: sl_unverified_until referenced in bot.py",
+      "sl_unverified_until" in bot_src,
+      "main loop must store grace expiry timestamp")
+
+check("v4 Fix F: sl_unverified RESOLVED log line",
+      "sl_unverified RESOLVED" in bot_src,
+      "main loop must log resolution on successful re-verify")
+
+check("v4 Fix F: TRULY MISSING after grace log line",
+      "TRULY MISSING after grace" in bot_src,
+      "main loop must log + emergency-close when grace elapses")
+
+check("v4 Fix F: verify_existing_sl called in main loop",
+      "executor.verify_existing_sl" in bot_src,
+      "main loop must call public re-verify helper")
+
+# Fix G — price-distance kill-switch
+check("v4 Fix G: price kill-switch present",
+      "sl_unverified + adverse" in bot_src,
+      "main loop must short-circuit close when adverse move > 0.5%")
+
+# ─────────────────────────────────────────────
 # 6. STRUCTURE SANITY
 # ─────────────────────────────────────────────
 print("\n[5] Structure Sanity")
 
-check(f"executor.py line count in range 580–1800 (got {len(exec_lines)})",
-      580 <= len(exec_lines) <= 1800,
+check(f"executor.py line count in range 580–1900 (got {len(exec_lines)})",
+      580 <= len(exec_lines) <= 1900,
       f"unexpected line count may indicate missing or duplicate content")
 
-check(f"bot.py line count in range 750–1400 (got {len(bot_lines)})",
-      750 <= len(bot_lines) <= 1400,
+check(f"bot.py line count in range 750–1500 (got {len(bot_lines)})",
+      750 <= len(bot_lines) <= 1500,
       f"unexpected line count may indicate missing or duplicate content")
 
 # Duplicate function definitions (the corruption we saw causes duplicates)
