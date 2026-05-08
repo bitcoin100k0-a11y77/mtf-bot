@@ -898,15 +898,32 @@ def execute_entry(sym: str, result: dict) -> dict:
     }
 
     # 🟢 v4 Fix F wiring: if executor.open_position trusted the id without
-    # full verify (Binance read-side lagged), schedule a 60s deferred
-    # re-verify in the main loop. 90s hard grace before emergency-close.
+    # full verify (Binance read-side lagged), schedule a deferred re-verify
+    # in the main loop. 90s hard grace before emergency-close.
+    # 🟢 v6 Fix I-c: when the executor took the fast-path (create_order
+    # acked NEW/ACCEPTED so no placement-time verify ran), tighten the first
+    # re-verify cadence to 20s instead of 60s. Catches a Binance auto-cancel
+    # post-creation 3× faster, shrinking the worst-case naked-position
+    # window from 60–90s to 20–90s. Subsequent checks stay on the 60s
+    # cadence governed by the same gate in the main loop.
     if exec_result.get("sl_unverified"):
         new_ot["sl_unverified_until"] = time.time() + 90.0
-        new_ot["sl_unverified_last_check"] = time.time()
-        log.warning(
-            f"{sym} entry created with sl_unverified=True — "
-            f"re-verify scheduled for +60s, hard grace +90s"
-        )
+        is_fast_path = bool(exec_result.get("fast_path"))
+        if is_fast_path:
+            # last_check = now - 40 → next gate fires after 20s elapses
+            # (gate condition is `now - last_check >= 60.0`).
+            new_ot["sl_unverified_last_check"] = time.time() - 40.0
+            new_ot["sl_unverified_fast_path"] = True
+            log.info(
+                f"{sym} entry created with fast_path sl_unverified — "
+                f"first re-verify at +20s, hard grace +90s"
+            )
+        else:
+            new_ot["sl_unverified_last_check"] = time.time()
+            log.warning(
+                f"{sym} entry created with sl_unverified=True — "
+                f"re-verify scheduled for +60s, hard grace +90s"
+            )
 
     # 🔴 FIX (Bug 1 cont.): server-side SL was placed at signal-time SL by
     # open_position. If slippage > 25% of ATR, refresh the server SL to the
