@@ -913,8 +913,8 @@ def _verify_sl_placed(
     sl_side: str,
     target_px: float,
     tol_pct: float = 0.2,
-    max_polls: int = 15,
-    poll_delay: float = 0.6,
+    max_polls: int = 20,
+    poll_delay: float = 0.5,
     expected_type: Optional[str] = None,
     expected_id: Optional[str] = None,
 ) -> bool:
@@ -983,24 +983,44 @@ def _verify_sl_placed(
             )
             return True
         time.sleep(poll_delay)
-    # 🔴 FIX (v3 Fix 5): direct fetch_order rescue. open_orders list can lag
-    # the order's actual state by seconds under load. fetch_order(id) is
-    # authoritative — if Binance has the order with active status, return
-    # True. Saves the diag/recovery path in the caller. Only runs once,
-    # only when we have an expected_id, only at end of loop (cheap insurance).
+    # 🔴 FIX (v3 Fix 5 / v5 Fix H): direct fetch_order rescue. open_orders list
+    # can lag the order's actual state by seconds under load. fetch_order(id) is
+    # authoritative — if Binance has the order with active status, return True.
+    # v5: 3 attempts × 2s — a single transient 5xx during this rescue used to
+    # push the caller into the sl_unverified path unnecessarily.
     if expected_id:
-        try:
-            ex2 = _get_exchange()
-            o = ex2.fetch_order(expected_id, ccxt_sym) or {}
-            status = (o.get("status") or "").lower()
-            if status in ("open", "new", "untriggered", "active"):
-                log.info(
-                    f"{symbol} SL verified by direct fetch_order id={expected_id} "
-                    f"(status={status}) — open_orders list lagging"
+        for rescue_attempt in range(1, 4):
+            try:
+                ex2 = _get_exchange()
+                o = ex2.fetch_order(expected_id, ccxt_sym) or {}
+                raw = o.get("info") or {}
+                status = (
+                    (o.get("status") or "").lower()
+                    or (raw.get("status") or "").lower()
                 )
-                return True
-        except Exception as fe:
-            log.warning(f"{symbol} fetch_order direct lookup failed: {fe}")
+                if status in (
+                    "open", "new", "untriggered", "active",
+                    "filled", "closed", "partially_filled",
+                ):
+                    log.info(
+                        f"{symbol} SL verified by direct fetch_order id={expected_id} "
+                        f"(status={status}, rescue_attempt={rescue_attempt}) — "
+                        f"open_orders list lagging"
+                    )
+                    return True
+                if status in ("canceled", "cancelled", "expired", "rejected"):
+                    log.warning(
+                        f"{symbol} fetch_order rescue: id={expected_id} "
+                        f"status={status!r} — order DEAD, no point retrying"
+                    )
+                    break
+            except Exception as fe:
+                log.warning(
+                    f"{symbol} fetch_order direct lookup attempt "
+                    f"{rescue_attempt}/3 failed: {fe}"
+                )
+            if rescue_attempt < 3:
+                time.sleep(2.0)
     log.error(
         f"{symbol} SL verification FAILED — no STOP_MARKET ({expected_type or 'any'}) "
         f"found at {target_px} after {max_polls} polls (tol {tol_pct}%, "
@@ -1055,29 +1075,178 @@ def _diagnose_sl_verify_fail(symbol: str, order_id: str) -> dict:
 
 
 def verify_existing_sl(symbol: str, sl_order_id: str, stop_price: float) -> dict:
-    """🟢 v4 Fix F: re-verify a previously-acked SL.
+    """🟢 v5 Fix H: re-verify a previously-acked SL with 4-state result.
 
-    Used by bot.py's 60s deferred re-verify cleanup pass to confirm a
-    `sl_unverified=True` trade's SL is genuinely on Binance. Calls
-    fetch_order(id) authoritatively. Returns:
-        {found: bool, status: str, info: dict}
-    found=True if order exists with active OR filled/closed status (stop
-    triggered already). found=False on fetch_order exception or genuinely
-    missing order.
+    Used by bot.py's 60s deferred re-verify cleanup pass to determine whether a
+    `sl_unverified=True` trade's SL is genuinely on Binance. Returns:
+        {status_code: str, status: str, info: dict, error: str|None}
+
+    status_code values (caller in bot.py branches on this):
+      - 'alive'      : SL exists with an active or already-filled status.
+                       Resolve cleanly.
+      - 'gone_clean' : SL canceled/expired AND position is flat. Position
+                       was closed by another path (TP fill, manual close,
+                       liquidation) and Binance auto-canceled the closePosition
+                       SL — this is a normal happy exit, not a failure.
+      - 'lost'      : SL canceled/expired/missing AND position is still open.
+                       Caller should re-arm or emergency-close.
+      - 'unknown'    : transient API failure or empty status across all
+                       attempts. Caller MUST NOT emergency-close on this.
+
+    Implementation:
+      - 3 attempts × 2s backoff. Each attempt calls fetch_order(id, sym) and
+        inspects both ccxt's unified `status` and the Binance raw `info.status`.
+      - On exception or empty status, retry. Only after all attempts
+        inconclusive do we return 'unknown'.
+      - On a positive DEAD status, gate against the live position state via
+        get_open_position() to distinguish a legitimate clean exit from a
+        truly naked position.
+
+    Why this matters: the previous version returned `found=False` on any
+    exception or non-whitelisted status. A single transient Binance 5xx wave
+    or an auto-cancel by Binance on a closePosition SL after the position
+    closed cleanly elsewhere both produced false-positive "SL LOST" alerts
+    that emergency-closed working trades.
     """
+    ALIVE = (
+        "open", "new", "untriggered", "active",
+        "filled", "closed", "partially_filled",
+    )
+    DEAD = ("canceled", "cancelled", "expired", "rejected")
+    last_err: Optional[str] = None
+    last_status: str = ""
+    last_info: dict = {}
+    for attempt in range(1, 4):
+        try:
+            ex = _get_exchange()
+            ccxt_sym = _symbol_to_ccxt(symbol)
+            o = ex.fetch_order(sl_order_id, ccxt_sym) or {}
+            raw = (o.get("info") or {})
+            unified = (o.get("status") or "").lower()
+            raw_status = (raw.get("status") or "").lower()
+            status = unified or raw_status
+            log.info(
+                f"verify_existing_sl({symbol},{sl_order_id}) "
+                f"attempt={attempt} unified={unified!r} raw={raw_status!r}"
+            )
+            last_status, last_info = status, raw
+            if status in ALIVE:
+                return {
+                    "status_code": "alive",
+                    "status": status,
+                    "info": raw,
+                    "error": None,
+                }
+            if status in DEAD:
+                pos = get_open_position(symbol)
+                if pos is None or float(pos.get("qty", 0) or 0) <= 0:
+                    return {
+                        "status_code": "gone_clean",
+                        "status": status,
+                        "info": raw,
+                        "error": None,
+                    }
+                return {
+                    "status_code": "lost",
+                    "status": status,
+                    "info": raw,
+                    "error": None,
+                }
+            last_err = f"empty/unknown status: unified={unified!r} raw={raw_status!r}"
+        except Exception as e:
+            last_err = str(e)
+            log.warning(
+                f"verify_existing_sl({symbol},{sl_order_id}) "
+                f"attempt={attempt}/3 fetch_order failed: {e}"
+            )
+        if attempt < 3:
+            time.sleep(2.0)
+    log.warning(
+        f"verify_existing_sl({symbol},{sl_order_id}) inconclusive after 3 attempts "
+        f"— returning 'unknown' (last_status={last_status!r}, last_err={last_err!r})"
+    )
+    return {
+        "status_code": "unknown",
+        "status": last_status,
+        "info": last_info,
+        "error": last_err,
+    }
+
+
+def _final_sl_lost_check(symbol: str, sl_order_id: str, ot: dict) -> str:
+    """🟢 v5 Fix H: positive-evidence gate before pulling the emergency-close
+    trigger when verify_existing_sl returned 'unknown' AND the 90s grace has
+    elapsed.
+
+    Rationale: 'unknown' means transient API failure, not "SL is gone." Before
+    nuking a working position we demand at least one piece of positive evidence.
+    Only when ALL three checks below come up dry do we conclude the SL is
+    truly lost.
+
+    Returns one of:
+      - 'alive' : SL is on the order book under any id, OR fetch_order(id)
+                  reports an active/filled status. Resolve.
+      - 'flat'  : Position is already at zero size. Nothing to protect; the
+                  trade closed by another path. Resolve silently.
+      - 'lost'  : Position is open AND no SL order exists for it. Caller may
+                  emergency-close.
+    """
+    try:
+        pos = get_open_position(symbol)
+        if pos is None or float(pos.get("qty", 0) or 0) <= 0:
+            log.info(f"{symbol} final-check: position flat — clean resolve")
+            return "flat"
+    except Exception as e:
+        log.warning(f"{symbol} final-check pos fetch failed: {e}")
+
+    direction = (ot or {}).get("dir", "")
+    sl_side = "sell" if direction == "LONG" else "buy"
+    target_pos_side = _position_side_for(direction) if direction else None
+    try:
+        ex = _get_exchange()
+        ccxt_sym = _symbol_to_ccxt(symbol)
+        for o in ex.fetch_open_orders(ccxt_sym):
+            info = o.get("info") or {}
+            otype = (info.get("type") or o.get("type") or "").upper()
+            if otype not in ("STOP_MARKET", "STOP"):
+                continue
+            if (o.get("side") or "").lower() != sl_side:
+                continue
+            if target_pos_side and info.get("positionSide") != target_pos_side:
+                continue
+            log.warning(
+                f"{symbol} final-check: alternate guarding SL on book "
+                f"id={o.get('id')} stopPrice={info.get('stopPrice')} "
+                f"closePosition={info.get('closePosition')!r} "
+                f"reduceOnly={info.get('reduceOnly')!r} — treating as alive"
+            )
+            return "alive"
+    except Exception as e:
+        log.warning(f"{symbol} final-check open_orders failed: {e}")
+
     try:
         ex = _get_exchange()
         ccxt_sym = _symbol_to_ccxt(symbol)
         o = ex.fetch_order(sl_order_id, ccxt_sym) or {}
-        status = (o.get("status") or "").lower()
-        return {
-            "found": status in ("open", "new", "untriggered", "active", "filled", "closed"),
-            "status": status,
-            "info": o.get("info") or {},
-        }
+        raw = o.get("info") or {}
+        status = (o.get("status") or raw.get("status") or "").lower()
+        if status in (
+            "open", "new", "untriggered", "active",
+            "filled", "closed", "partially_filled",
+        ):
+            log.info(
+                f"{symbol} final-check: fetch_order(id={sl_order_id}) "
+                f"status={status!r} — alive"
+            )
+            return "alive"
     except Exception as e:
-        log.warning(f"verify_existing_sl({symbol},{sl_order_id}) failed: {e}")
-        return {"found": False, "status": "", "info": {}, "error": str(e)}
+        log.warning(f"{symbol} final-check fetch_order failed: {e}")
+
+    log.error(
+        f"{symbol} final-check: no guarding SL on book AND fetch_order(id) "
+        f"inconclusive AND position still open — declaring 'lost'"
+    )
+    return "lost"
 
 
 def _place_closeposition_sl_with_retry(
