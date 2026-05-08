@@ -780,6 +780,34 @@ def tg_exec_error(sym, action, error):
        f"⚠️ Check Binance Futures position manually!")
 
 
+# 🟢 v4 Fix E: Telegram alerts for the trust-id / unverified-SL path.
+# Fired when create_order returns a valid id but verify+diag both lag the
+# Binance read-side. Bot trusts the id (Fix A in executor.py), tells the
+# user via tg_sl_unverified, then re-verifies in 60s. tg_sl_resolved cancels
+# the alert when the SL is confirmed live; tg_sl_lost fires only if the SL
+# is genuinely missing after the 90s grace and the bot emergency-closes.
+def tg_sl_unverified(symbol, order_id, stop_price):
+    """Alert: SL placed (write-acked) but Binance read-side lagging."""
+    tg(f"<b>⚠️ SL UNVERIFIED (id-trusted)</b>\n"
+       f"Symbol     : {symbol}\n"
+       f"Order id   : {order_id}\n"
+       f"Stop       : {stop_price}\n"
+       f"Status     : write-acked, read-side lagging\n"
+       f"Cleanup    : auto re-verify in 60s\n"
+       f"Action     : check Binance manually if no auto-resolved msg in 90s")
+
+def tg_sl_resolved(symbol, order_id):
+    """Alert: previously-unverified SL confirmed live on Binance."""
+    tg(f"<b>✅ SL RESOLVED ({symbol})</b>\n"
+       f"id={order_id} confirmed live on Binance")
+
+def tg_sl_lost(symbol, order_id):
+    """Alert: SL truly missing after grace — emergency close fired."""
+    tg(f"<b>\U0001f6a8 SL LOST ({symbol})</b>\n"
+       f"id={order_id} truly missing after 90s grace.\n"
+       f"Bot has emergency-closed the position. Verify on Binance NOW.")
+
+
 # ─── Execution integration helpers ───────────────────────────────────────────
 
 def execute_entry(sym: str, result: dict) -> dict:
@@ -868,6 +896,17 @@ def execute_entry(sym: str, result: dict) -> dict:
         "exec_sl_id":     exec_result["sl_order_id"],
         "exec_fill_price": fill_price,
     }
+
+    # 🟢 v4 Fix F wiring: if executor.open_position trusted the id without
+    # full verify (Binance read-side lagged), schedule a 60s deferred
+    # re-verify in the main loop. 90s hard grace before emergency-close.
+    if exec_result.get("sl_unverified"):
+        new_ot["sl_unverified_until"] = time.time() + 90.0
+        new_ot["sl_unverified_last_check"] = time.time()
+        log.warning(
+            f"{sym} entry created with sl_unverified=True — "
+            f"re-verify scheduled for +60s, hard grace +90s"
+        )
 
     # 🔴 FIX (Bug 1 cont.): server-side SL was placed at signal-time SL by
     # open_position. If slippage > 25% of ATR, refresh the server SL to the
@@ -1210,6 +1249,73 @@ def main():
                     # ── Exit check ─────────────────────────────────
                     ot = S["open_trades"].get(sym)
                     if ot:
+                        # 🟢 v4 Fix F: deferred re-verify of sl_unverified trades
+                        # (set in execute_entry when executor's Fix A trust-id
+                        # path fired — Binance write-acked the SL but read-side
+                        # lagged). 60s cadence; clear flag on confirmed live;
+                        # emergency-close on grace expiry. AND
+                        # 🟢 v4 Fix G: price-distance kill-switch — if adverse
+                        # move >0.5% while sl_unverified is pending, force
+                        # close immediately regardless of grace timer.
+                        if ot.get("sl_unverified_until"):
+                            now_ts = time.time()
+                            sl_id = ot.get("exec_sl_id")
+                            adverse_pct = 0.0
+                            entry = ot.get("entry") or 0.0
+                            if entry > 0 and px > 0:
+                                adverse_pct = (
+                                    (entry - px) / entry * 100.0 if ot["dir"] == "LONG"
+                                    else (px - entry) / entry * 100.0
+                                )
+                            # Fix G: kill-switch first — adverse move beats grace
+                            if adverse_pct > 0.5:
+                                log.error(
+                                    f"{sym} sl_unverified + adverse {adverse_pct:.2f}% "
+                                    f"— force close (kill-switch)"
+                                )
+                                try:
+                                    executor.close_full_position(sym)
+                                except Exception as ce:
+                                    log.error(f"{sym} force close failed: {ce}")
+                                try:
+                                    tg_sl_lost(sym, sl_id)
+                                except Exception:
+                                    pass
+                                ot["bars"] = max(ot.get("bars", 0), Cfg.MAX_HOLD)
+                                ot["close_reason"] = "SL_KILLSWITCH"
+                            else:
+                                # Fix F: 60s-cadence re-verify
+                                last_chk = ot.get("sl_unverified_last_check", 0)
+                                if now_ts - last_chk >= 60.0 and sl_id:
+                                    ot["sl_unverified_last_check"] = now_ts
+                                    chk = executor.verify_existing_sl(sym, sl_id, ot["sl"])
+                                    if chk["found"]:
+                                        log.info(
+                                            f"{sym} sl_unverified RESOLVED — id={sl_id} "
+                                            f"status={chk['status']}"
+                                        )
+                                        ot.pop("sl_unverified_until", None)
+                                        ot.pop("sl_unverified_last_check", None)
+                                        try:
+                                            tg_sl_resolved(sym, sl_id)
+                                        except Exception:
+                                            pass
+                                    elif now_ts > ot["sl_unverified_until"]:
+                                        log.error(
+                                            f"{sym} SL TRULY MISSING after grace "
+                                            f"— emergency closing (id={sl_id})"
+                                        )
+                                        try:
+                                            executor.close_full_position(sym)
+                                        except Exception as ce:
+                                            log.error(f"{sym} emergency close failed: {ce}")
+                                        try:
+                                            tg_sl_lost(sym, sl_id)
+                                        except Exception:
+                                            pass
+                                        ot["bars"] = max(ot.get("bars", 0), Cfg.MAX_HOLD)
+                                        ot["close_reason"] = "SL_LOST"
+
                         events, closed, c_reason, c_px = check_exits(ot, d5)
 
                         # Execute events on exchange — only notify Telegram on confirmed close
