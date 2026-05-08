@@ -218,14 +218,18 @@ check("v4 Fix B: diag wrapped in try/except in BOTH helpers",
       exec_src.count("diag raised") >= 2,
       "_diagnose_sl_verify_fail call must be try-wrapped in both retry helpers")
 
-# Fix C — verify defaults bumped
-check("v4 Fix C: max_polls=15 default in _verify_sl_placed",
-      "max_polls: int = 15" in exec_src,
-      "verify budget must be 15 polls")
+# Fix C / v5 Fix H — verify defaults bumped (v4: 15/0.6 → v5: 20/0.5 = 10s budget)
+check("v5 Fix H: max_polls=20 default in _verify_sl_placed",
+      "max_polls: int = 20" in exec_src,
+      "verify budget must be 20 polls (v5 widened from 15 to 20)")
 
-check("v4 Fix C: poll_delay=0.6 default in _verify_sl_placed",
-      "poll_delay: float = 0.6" in exec_src,
-      "verify poll delay must be 0.6s")
+check("v5 Fix H: poll_delay=0.5 default in _verify_sl_placed",
+      "poll_delay: float = 0.5" in exec_src,
+      "verify poll delay must be 0.5s (v5 reduced from 0.6 to 0.5)")
+
+check("v5 Fix H: _verify_sl_placed final fetch_order rescue retries 3x",
+      "rescue_attempt" in exec_src,
+      "final fetch_order rescue must retry on transient API failure")
 
 # Fix D — extended diag telemetry
 check("v4 Fix D: clientId in diag log",
@@ -263,9 +267,9 @@ check("v4 Fix F: sl_unverified RESOLVED log line",
       "sl_unverified RESOLVED" in bot_src,
       "main loop must log resolution on successful re-verify")
 
-check("v4 Fix F: TRULY MISSING after grace log line",
-      "TRULY MISSING after grace" in bot_src,
-      "main loop must log + emergency-close when grace elapses")
+check("v4 Fix F / v5 Fix H: emergency-close path remains in bot.py",
+      "SL_LOST" in bot_src and "tg_sl_lost" in bot_src,
+      "main loop must retain emergency-close + Telegram alert path")
 
 check("v4 Fix F: verify_existing_sl called in main loop",
       "executor.verify_existing_sl" in bot_src,
@@ -277,16 +281,43 @@ check("v4 Fix G: price kill-switch present",
       "main loop must short-circuit close when adverse move > 0.5%")
 
 # ─────────────────────────────────────────────
+# v5 Fix H — false-positive SL_LOST elimination
+# ─────────────────────────────────────────────
+check("v5 Fix H: verify_existing_sl returns status_code (4-state)",
+      "status_code" in exec_src and "'gone_clean'" in exec_src and "'unknown'" in exec_src,
+      "verify_existing_sl must return one of alive/gone_clean/lost/unknown")
+
+check("v5 Fix H: verify_existing_sl retries fetch_order on transient failure",
+      "for attempt in range(1, 4):" in exec_src,
+      "verify_existing_sl must do 3 attempts × 2s before giving up")
+
+check("v5 Fix H: _final_sl_lost_check helper defined in executor.py",
+      "def _final_sl_lost_check" in exec_src,
+      "positive-evidence helper required to gate emergency close on 'unknown'")
+
+check("v5 Fix H: bot.py consumes new status_code values",
+      'chk.get("status_code"' in bot_src and '"gone_clean"' in bot_src and '"unknown"' in bot_src,
+      "bot.py main loop must branch on new 4-state status_code from verify_existing_sl")
+
+check("v5 Fix H: bot.py re-arms SL via move_stop_loss before emergency close",
+      "move_stop_loss" in bot_src and "re-arm" in bot_src,
+      "on status_code='lost' bot must attempt re-arm before nuking")
+
+check("v5 Fix H: bot.py calls _final_sl_lost_check on grace-end + unknown",
+      "_final_sl_lost_check" in bot_src,
+      "bot must demand positive evidence before emergency-closing on 'unknown'")
+
+# ─────────────────────────────────────────────
 # 6. STRUCTURE SANITY
 # ─────────────────────────────────────────────
 print("\n[5] Structure Sanity")
 
-check(f"executor.py line count in range 580–1900 (got {len(exec_lines)})",
-      580 <= len(exec_lines) <= 1900,
+check(f"executor.py line count in range 580–2200 (got {len(exec_lines)})",
+      580 <= len(exec_lines) <= 2200,
       f"unexpected line count may indicate missing or duplicate content")
 
-check(f"bot.py line count in range 750–1500 (got {len(bot_lines)})",
-      750 <= len(bot_lines) <= 1500,
+check(f"bot.py line count in range 750–1800 (got {len(bot_lines)})",
+      750 <= len(bot_lines) <= 1800,
       f"unexpected line count may indicate missing or duplicate content")
 
 # Duplicate function definitions (the corruption we saw causes duplicates)
