@@ -474,6 +474,10 @@ def open_position(
 
     if sl_result["success"]:
         result["sl_order_id"] = sl_result["sl_order_id"]
+        # 🟢 FIX (v4 Fix A): propagate sl_unverified flag to caller.
+        # bot.py reads this to schedule a 60s re-verify (Fix F).
+        if sl_result.get("sl_unverified"):
+            result["sl_unverified"] = True
     else:
         # 🔴 FIX (Bug 3): SL failed after 3 retries → entry is naked.
         # Old behavior left the position unguarded with success=True. New:
@@ -909,8 +913,8 @@ def _verify_sl_placed(
     sl_side: str,
     target_px: float,
     tol_pct: float = 0.2,
-    max_polls: int = 10,
-    poll_delay: float = 0.5,
+    max_polls: int = 15,
+    poll_delay: float = 0.6,
     expected_type: Optional[str] = None,
     expected_id: Optional[str] = None,
 ) -> bool:
@@ -1027,9 +1031,16 @@ def _diagnose_sl_verify_fail(symbol: str, order_id: str) -> dict:
         ccxt_sym = _symbol_to_ccxt(symbol)
         o = ex.fetch_order(order_id, ccxt_sym) or {}
         info = o.get("info", {}) or {}
+        # 🟢 FIX (v4 Fix D): extended telemetry. Adds clientId, raw vs unified
+        # status, updateTime, and local time delta so the next failure has
+        # actionable data without needing to instrument live.
         log.error(
             f"{symbol} verify-fail diag: id={order_id} "
-            f"status={o.get('status')!r} "
+            f"clientId={info.get('clientOrderId')!r} "
+            f"status_unified={o.get('status')!r} "
+            f"status_raw={info.get('status')!r} "
+            f"updateTime={info.get('updateTime')} "
+            f"local_now={int(time.time()*1000)} "
             f"filled={o.get('filled')}/{o.get('amount')} "
             f"stopPrice={info.get('stopPrice')!r} "
             f"reduceOnly={info.get('reduceOnly')!r} "
@@ -1041,6 +1052,32 @@ def _diagnose_sl_verify_fail(symbol: str, order_id: str) -> dict:
     except Exception as e:
         log.error(f"{symbol} verify-fail diag — fetch_order({order_id}) failed: {e}")
         return {}
+
+
+def verify_existing_sl(symbol: str, sl_order_id: str, stop_price: float) -> dict:
+    """🟢 v4 Fix F: re-verify a previously-acked SL.
+
+    Used by bot.py's 60s deferred re-verify cleanup pass to confirm a
+    `sl_unverified=True` trade's SL is genuinely on Binance. Calls
+    fetch_order(id) authoritatively. Returns:
+        {found: bool, status: str, info: dict}
+    found=True if order exists with active OR filled/closed status (stop
+    triggered already). found=False on fetch_order exception or genuinely
+    missing order.
+    """
+    try:
+        ex = _get_exchange()
+        ccxt_sym = _symbol_to_ccxt(symbol)
+        o = ex.fetch_order(sl_order_id, ccxt_sym) or {}
+        status = (o.get("status") or "").lower()
+        return {
+            "found": status in ("open", "new", "untriggered", "active", "filled", "closed"),
+            "status": status,
+            "info": o.get("info") or {},
+        }
+    except Exception as e:
+        log.warning(f"verify_existing_sl({symbol},{sl_order_id}) failed: {e}")
+        return {"found": False, "status": "", "info": {}, "error": str(e)}
 
 
 def _place_closeposition_sl_with_retry(
@@ -1151,6 +1188,33 @@ def _place_closeposition_sl_with_retry(
             )
             order_id = sl_order.get("id", "unknown")
 
+            # 🟢 FIX (v4 Fix A): inspect create_order response status.
+            # See reduceOnly helper for full rationale.
+            create_info = sl_order.get("info") or {}
+            create_raw_status = (create_info.get("status") or "").upper()
+            create_unified_status = (sl_order.get("status") or "").lower()
+            order_known_active = (
+                create_raw_status in ("NEW", "ACCEPTED", "PARTIALLY_FILLED")
+                or create_unified_status in ("open", "new", "untriggered", "active")
+            )
+            order_known_dead = (
+                create_raw_status in ("REJECTED", "EXPIRED", "EXPIRED_IN_MATCH", "CANCELED")
+                or create_unified_status in ("rejected", "expired", "canceled")
+            )
+            if order_known_dead:
+                last_err = Exception(
+                    f"create_order returned dead status: "
+                    f"raw={create_raw_status} unified={create_unified_status}"
+                )
+                log.error(
+                    f"{symbol} SL {order_id} dead at create — retry. "
+                    f"err={last_err}"
+                )
+                if attempt < max_attempts:
+                    time.sleep(max(2.5, 2.0 * attempt))
+                    continue
+                break
+
             # 🔴 FIX (Bug 2): verify the SL actually shows in open orders before
             # declaring success. create_order's response can lead the order-list
             # by hundreds of ms; without this check, the caller may trust a
@@ -1166,7 +1230,12 @@ def _place_closeposition_sl_with_retry(
                 # instant-fill (status=filled/closed). If SL triggered between
                 # placement and verify, position is closed — don't retry,
                 # don't emergency-close again, just declare success.
-                diag = _diagnose_sl_verify_fail(symbol, order_id)
+                # 🟢 FIX (v4 Fix B): wrap diag in try/except.
+                try:
+                    diag = _diagnose_sl_verify_fail(symbol, order_id)
+                except Exception as de:
+                    log.warning(f"{symbol} diag raised: {de}")
+                    diag = {}
                 diag_status = (diag.get("status") or "").lower()
                 if diag_status in ("filled", "closed"):
                     log.warning(
@@ -1197,6 +1266,29 @@ def _place_closeposition_sl_with_retry(
                         "sl_order_id": order_id,
                         "error": None,
                         "verify_recovered": True,
+                    })
+                    return result
+                # 🟢 FIX (v4 Fix A core): trust id when verify+diag both lag.
+                if order_known_active or (
+                    create_raw_status == "" and create_unified_status == ""
+                ):
+                    log.warning(
+                        f"{symbol} closePosition SL {order_id} write-acked "
+                        f"(raw={create_raw_status} unified={create_unified_status}) "
+                        f"but read-side lagging. TRUSTING id. "
+                        f"Telegram alert + cleanup re-verify in 60s."
+                    )
+                    try:
+                        from bot import tg_sl_unverified
+                        tg_sl_unverified(symbol, order_id, stop_price)
+                    except Exception as te:
+                        log.warning(f"tg_sl_unverified send failed: {te}")
+                    result.update({
+                        "success": True,
+                        "sl_order_id": order_id,
+                        "error": None,
+                        "verify_recovered": False,
+                        "sl_unverified": True,
                     })
                     return result
                 last_err = Exception(
@@ -1311,6 +1403,37 @@ def _place_reduceonly_sl_with_retry(
             )
             order_id = sl_order.get("id", "unknown")
 
+            # 🟢 FIX (v4 Fix A): inspect the create_order response status
+            # BEFORE going to verify. If Binance synchronously rejected
+            # (REJECTED/EXPIRED/CANCELED), retry. If accepted (NEW/ACCEPTED),
+            # the id is post-commit and verify becomes a sanity check.
+            # When verify+diag both lag (Binance read-side stale), we trust
+            # the id rather than emergency-closing a working trade.
+            create_info = sl_order.get("info") or {}
+            create_raw_status = (create_info.get("status") or "").upper()
+            create_unified_status = (sl_order.get("status") or "").lower()
+            order_known_active = (
+                create_raw_status in ("NEW", "ACCEPTED", "PARTIALLY_FILLED")
+                or create_unified_status in ("open", "new", "untriggered", "active")
+            )
+            order_known_dead = (
+                create_raw_status in ("REJECTED", "EXPIRED", "EXPIRED_IN_MATCH", "CANCELED")
+                or create_unified_status in ("rejected", "expired", "canceled")
+            )
+            if order_known_dead:
+                last_err = Exception(
+                    f"create_order returned dead status: "
+                    f"raw={create_raw_status} unified={create_unified_status}"
+                )
+                log.error(
+                    f"{symbol} SL {order_id} dead at create — retry. "
+                    f"err={last_err}"
+                )
+                if attempt < max_attempts:
+                    time.sleep(max(2.5, 2.0 * attempt))
+                    continue
+                break
+
             # 🔴 FIX (Bug 2): verify the reduceOnly SL is actually queryable in
             # open orders before declaring success. Without this, a race where
             # create_order succeeds but order-list lookup fails leaves the bot
@@ -1327,7 +1450,13 @@ def _place_reduceonly_sl_with_retry(
                 # already triggered between placement and verify (instant fill
                 # near stop) — position is closed; do NOT emergency-close
                 # AGAIN, just declare success.
-                diag = _diagnose_sl_verify_fail(symbol, order_id)
+                # 🟢 FIX (v4 Fix B): wrap diag in try/except — if diag itself
+                # raises (network/exchange dead), don't crash retry loop.
+                try:
+                    diag = _diagnose_sl_verify_fail(symbol, order_id)
+                except Exception as de:
+                    log.warning(f"{symbol} diag raised: {de}")
+                    diag = {}
                 diag_status = (diag.get("status") or "").lower()
                 if diag_status in ("filled", "closed"):
                     log.warning(
@@ -1360,6 +1489,34 @@ def _place_reduceonly_sl_with_retry(
                         "sl_order_id": order_id,
                         "error": None,
                         "verify_recovered": True,
+                    })
+                    return result
+                # 🟢 FIX (v4 Fix A core): verify+diag BOTH empty/lagging BUT
+                # we have a known-active id from create_order. This is a
+                # Binance read-side lag, NOT a placement failure. DO NOT retry
+                # (would create duplicate SL). DO NOT emergency-close. Declare
+                # success with sl_unverified flag — bot.py main loop will
+                # re-verify in 60s with a fresh API state (Fix F + Fix G).
+                if order_known_active or (
+                    create_raw_status == "" and create_unified_status == ""
+                ):
+                    log.warning(
+                        f"{symbol} SL {order_id} write-acked "
+                        f"(raw={create_raw_status} unified={create_unified_status}) "
+                        f"but read-side lagging. TRUSTING id. "
+                        f"Telegram alert + cleanup re-verify in 60s."
+                    )
+                    try:
+                        from bot import tg_sl_unverified
+                        tg_sl_unverified(symbol, order_id, stop_price)
+                    except Exception as te:
+                        log.warning(f"tg_sl_unverified send failed: {te}")
+                    result.update({
+                        "success": True,
+                        "sl_order_id": order_id,
+                        "error": None,
+                        "verify_recovered": False,
+                        "sl_unverified": True,
                     })
                     return result
                 last_err = Exception(
