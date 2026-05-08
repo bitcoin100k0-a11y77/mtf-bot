@@ -1384,12 +1384,44 @@ def _place_closeposition_sl_with_retry(
                     continue
                 break
 
+            # 🟢 FIX (v6 Fix I): fast-path skip-verify when create_order's
+            # response carries an authoritative active status (NEW / ACCEPTED /
+            # PARTIALLY_FILLED). Binance's matching engine never returns these
+            # statuses for non-existent or rejected orders, so the 16s of REST
+            # polling that follows is racing read-after-write consistency for
+            # an answer we already possess. Setting sl_unverified=True keeps
+            # v5 Fix H's deferred 60s re-verify (tightened to 20s on fast-path
+            # via bot.py I-c) as a silent sanity net — if Binance ever auto-
+            # cancels post-creation, the 4-state verifier catches it and
+            # re-arms via move_stop_loss before any naked-position window.
+            # Crucially: do NOT fire tg_sl_unverified here. The Telegram alert
+            # is reserved for the rare empty-status fallback below.
+            if order_known_active:
+                log.info(
+                    f"{symbol} closePosition SL {order_id} create-acked "
+                    f"(raw={create_raw_status!r} unified={create_unified_status!r}) "
+                    f"— fast-path skip verify (≈16s REST polling avoided). "
+                    f"v5 Fix H deferred check will silently confirm."
+                )
+                result.update({
+                    "success": True,
+                    "sl_order_id": order_id,
+                    "error": None,
+                    "verify_recovered": False,
+                    "sl_unverified": True,
+                    "fast_path": True,
+                })
+                return result
+
             # 🔴 FIX (Bug 2): verify the SL actually shows in open orders before
             # declaring success. create_order's response can lead the order-list
             # by hundreds of ms; without this check, the caller may trust a
             # success flag that's not yet reflected on the exchange.
             # Type-aware so we don't confirm a stale reduceOnly at same price.
             # 🔴 FIX ('verify-fail' Fix 2): pass expected_id for direct id-match.
+            # 🟢 NOTE (v6 Fix I): only reached when create_order returned an
+            # empty status — the rare ambiguous response. Active-status orders
+            # short-circuit above.
             if not _verify_sl_placed(
                 symbol, sl_side, stop_price,
                 expected_type="closePosition",
@@ -1603,12 +1635,35 @@ def _place_reduceonly_sl_with_retry(
                     continue
                 break
 
+            # 🟢 FIX (v6 Fix I): fast-path skip-verify when create_order's
+            # response carries an authoritative active status. See closePosition
+            # path above for full rationale. The sl_unverified flag keeps the
+            # v5 Fix H deferred re-verify (tightened to 20s on fast-path) as the
+            # safety net; tg_sl_unverified does NOT fire on this branch.
+            if order_known_active:
+                log.info(
+                    f"{symbol} reduceOnly SL {order_id} create-acked "
+                    f"(raw={create_raw_status!r} unified={create_unified_status!r}) "
+                    f"— fast-path skip verify (≈16s REST polling avoided). "
+                    f"v5 Fix H deferred check will silently confirm."
+                )
+                result.update({
+                    "success": True,
+                    "sl_order_id": order_id,
+                    "error": None,
+                    "verify_recovered": False,
+                    "sl_unverified": True,
+                    "fast_path": True,
+                })
+                return result
+
             # 🔴 FIX (Bug 2): verify the reduceOnly SL is actually queryable in
             # open orders before declaring success. Without this, a race where
             # create_order succeeds but order-list lookup fails leaves the bot
             # trusting a non-existent SL and the position effectively naked.
             # Type-aware to reject stale closePosition at same price.
             # 🔴 FIX ('verify-fail' Fix 2): pass expected_id for direct id-match.
+            # 🟢 NOTE (v6 Fix I): only reached on empty-status responses now.
             if not _verify_sl_placed(
                 symbol, sl_side, stop_price,
                 expected_type="reduceOnly",
