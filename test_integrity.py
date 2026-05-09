@@ -327,6 +327,25 @@ check("v6 Fix I: tg_sl_unverified call-sites unchanged (fast-path adds none)",
       "exactly 2 call-sites must remain — one per placement helper's empty-status fallback")
 
 # ─────────────────────────────────────────────
+# v7 Fix J — kill premature TIME-labeled closes
+# ─────────────────────────────────────────────
+check("v7 Fix J-1: check_exits preserves pre-set close_reason",
+      'pre_reason or "TIME"' in bot_src,
+      "check_exits must return pre-set close_reason if a sl_unverified branch labeled it")
+
+check("v7 Fix J-2: MAX_HOLD reads from MAX_HOLD_BARS env",
+      "MAX_HOLD_BARS" in bot_src,
+      "MAX_HOLD must be env-configurable via os.getenv('MAX_HOLD_BARS', ...)")
+
+check("v7 Fix J-3: verify_existing_sl distinguishes pos=None from qty<=0",
+      "get_open_position returned None" in exec_src,
+      "DEAD-status branch must NOT silently treat None as flat — falls through to retry")
+
+check("v7 Fix J-4: _final_sl_lost_check distinguishes pos=None from qty<=0",
+      "do NOT default to 'flat'" in exec_src,
+      "final-check flat decision must require positive position fetch")
+
+# ─────────────────────────────────────────────
 # 6. STRUCTURE SANITY
 # ─────────────────────────────────────────────
 print("\n[5] Structure Sanity")
