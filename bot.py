@@ -82,7 +82,10 @@ class Cfg:
     TP2_FRAC    = 0.20        # v5: 20% at TP2 (was 30%); remaining 30% at TP3
     # TP1+TP2+TP3 fracs = 0.50+0.20+0.30 = 1.0
 
-    MAX_HOLD    = 36          # v5: 36 bars = 3h (was 48/4h) — lower DD, better PF
+    # 🟢 v7 Fix J-2: env-tunable. Default 72 bars (6h) — was 36 (3h), too tight
+    # for live strategy. Override per-VPS via MAX_HOLD_BARS env var.
+    # Each bar = one 5-minute candle (one main loop tick).
+    MAX_HOLD    = int(os.getenv("MAX_HOLD_BARS", "72"))
     IC          = 10_000.0    # initial capital (virtual tracking)
     RISK_PCT    = 0.01        # 🔴 RISK: 1.0% risk per trade
 
@@ -658,7 +661,15 @@ def check_exits(ot, d5):
         t_pnl = ((c - ot["entry"]) if dirn=="LONG" else (ot["entry"] - c)) \
                 * ot["size"] * ot["rem"]
         ot["pnl"] += t_pnl; ot["rem"] = 0
-        return events, True, "TIME", c
+        # 🟢 v7 Fix J-1: preserve pre-set close_reason. The five sl_unverified
+        # branches above (kill-switch, gone_clean, lost+rearm-fail, unknown→flat,
+        # unknown→lost) pin bars=MAX_HOLD to force-close on the next tick AND
+        # set close_reason to the actual cause (SL_KILLSWITCH, SL_LOST,
+        # SL_AUTO_CANCEL_CLEAN, ALREADY_FLAT). Without this preservation, every
+        # such force-close gets mislabeled "TIME" downstream, masking the real
+        # reason and making it look like the MAX_HOLD timer fired naturally.
+        pre_reason = ot.get("close_reason")
+        return events, True, (pre_reason or "TIME"), c
 
     return events, False, None, None
 
