@@ -1138,21 +1138,49 @@ def verify_existing_sl(symbol: str, sl_order_id: str, stop_price: float) -> dict
                     "error": None,
                 }
             if status in DEAD:
+                # 🟢 v7 Fix J-3: require POSITIVE confirmation that position
+                # is flat. The previous version treated `pos is None`
+                # (returned by get_open_position when the underlying
+                # fetch_positions call raised — transient 5xx, rate-limit,
+                # DNS hiccup) identically to a confirmed qty=0. That
+                # collapsed two very different states into "gone_clean",
+                # which downstream forced bars=MAX_HOLD ⇒ check_exits
+                # rebadged the close as "TIME" ⇒ user saw a healthy trade
+                # close at ~$0 P&L for ostensibly TIME reasons.
+                # New behavior: only declare gone_clean when get_open_position
+                # actually returned a position dict with qty<=0. On None
+                # (API failure), fall through to retry — never rush a
+                # force-close on uncertain evidence.
                 pos = get_open_position(symbol)
-                if pos is None or float(pos.get("qty", 0) or 0) <= 0:
+                if pos is None:
+                    last_err = (
+                        f"DEAD status={status!r} but get_open_position "
+                        f"returned None (API failure?) — treating as "
+                        f"'unknown', will retry"
+                    )
+                    log.warning(
+                        f"verify_existing_sl({symbol},{sl_order_id}) {last_err}"
+                    )
+                elif float(pos.get("qty", 0) or 0) <= 0:
                     return {
                         "status_code": "gone_clean",
                         "status": status,
                         "info": raw,
                         "error": None,
                     }
-                return {
-                    "status_code": "lost",
-                    "status": status,
-                    "info": raw,
-                    "error": None,
-                }
-            last_err = f"empty/unknown status: unified={unified!r} raw={raw_status!r}"
+                else:
+                    return {
+                        "status_code": "lost",
+                        "status": status,
+                        "info": raw,
+                        "error": None,
+                    }
+            else:
+                # Status neither ALIVE nor DEAD ⇒ empty / unknown ⇒ retry.
+                last_err = (
+                    f"empty/unknown status: unified={unified!r} "
+                    f"raw={raw_status!r}"
+                )
         except Exception as e:
             last_err = str(e)
             log.warning(
@@ -1191,9 +1219,23 @@ def _final_sl_lost_check(symbol: str, sl_order_id: str, ot: dict) -> str:
       - 'lost'  : Position is open AND no SL order exists for it. Caller may
                   emergency-close.
     """
+    # 🟢 v7 Fix J-4: only declare 'flat' on POSITIVE confirmation. Previous
+    # version treated `pos is None` (silent fallback when get_open_position
+    # caught an exception) the same as a confirmed qty=0. That allowed a
+    # transient API failure during the grace-end final check to short-
+    # circuit to 'flat' ⇒ caller in bot.py pinned bars=MAX_HOLD ⇒ check_exits
+    # mislabeled the close as TIME ⇒ user saw a healthy trade closed at
+    # ~$0 P&L. Now: pos=None falls through to the open_orders + fetch_order
+    # checks below, never short-circuiting on uncertain evidence.
     try:
         pos = get_open_position(symbol)
-        if pos is None or float(pos.get("qty", 0) or 0) <= 0:
+        if pos is None:
+            log.warning(
+                f"{symbol} final-check: get_open_position returned None — "
+                f"continuing to other checks (do NOT default to 'flat' on "
+                f"transient API failure)"
+            )
+        elif float(pos.get("qty", 0) or 0) <= 0:
             log.info(f"{symbol} final-check: position flat — clean resolve")
             return "flat"
     except Exception as e:
