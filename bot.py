@@ -56,36 +56,37 @@ class Cfg:
     RSI_P       = 14
     ATR_P       = 14
 
-    # ── Entry filters ─────────────────────────────────────────────
-    PULL_PCT    = 0.012       # v6: 1.2% pull-back zone (was 0.5%) — wider zone catches more setups
-    RSI_LO      = 45          # v3: long when RSI < 45 (was 40)
-    RSI_HI      = 60          # v3: short when RSI > 60 (unchanged)
+    # ── Entry filters (v8 Fix K: REVERTED to v4 pre-backtest tweak) ──
+    PULL_PCT    = 0.005       # v4: 0.5% pull-back zone (was 1.2% in v6)
+    RSI_LO      = 45          # v3/v4 (unchanged)
+    RSI_HI      = 60          # v3/v4 (unchanged)
     RSI_FLOOR   = 25.0
     RSI_CEIL    = 75.0
-    ATR_REL     = 0.55        # v6: 0.55x avg (was 0.70x) — less aggressive chop filter
+    ATR_REL     = 0.70        # v4: 0.70x avg (was 0.55x in v6) — chop filter
     ATR_AVG_N   = 100
 
-    # ── Session filter (v5 EXPANDED) ─────────────────────────────
-    SESSION_START = 6         # v5: 06:00 UTC (was 07:00) — capture London pre-market
-    SESSION_END   = 22        # v5: 22:00 UTC (was 20:00) — capture full NY session
+    # ── Session filter (v8 Fix K: 24/7 — gate disabled in get_signal) ──
+    # Sentinels kept so any stray reference still parses. The session
+    # check in get_signal is commented out — see "Session filter — DISABLED".
+    SESSION_START = 0
+    SESSION_END   = 24
 
-    # ── 1H RSI filter (v3 NEW) ────────────────────────────────────
+    # ── 1H RSI filter (v3 NEW, retained in v4) ────────────────────
     RSI_1H_LO   = 40.0        # 1H RSI must be > 40 to go LONG
     RSI_1H_HI   = 60.0        # 1H RSI must be < 60 to go SHORT
 
-    # ── Risk & sizing ─────────────────────────────────────────────
-    SL_MULT     = 1.5         # v5: 1.5× ATR (was 1.8) — backtest #1 of 100 combos
-    TP1_MULT    = 4.5         # v3: 4.5× ATR (was 3.5)
-    TP2_MULT    = 7.2         # v3: 7.2× ATR (= 1.6 × TP1)
-    TP3_MULT    = 30.0        # v4: 30x ATR - catch bigger runners (was 18x)
-    TP1_FRAC    = 0.50        # v5: close 50% at TP1 (was 40%) — bank faster
-    TP2_FRAC    = 0.20        # v5: 20% at TP2 (was 30%); remaining 30% at TP3
-    # TP1+TP2+TP3 fracs = 0.50+0.20+0.30 = 1.0
+    # ── Risk & sizing (v8 Fix K: REVERTED to v4) ──────────────────
+    SL_MULT     = 1.8         # v4 (was 1.5 in v5)
+    TP1_MULT    = 4.5         # v3/v4 (unchanged)
+    TP2_MULT    = 7.2         # v3/v4 (= 1.6 × TP1, unchanged)
+    TP3_MULT    = 18.0        # v4 (was 30 in v4-later/v5 — runner catch removed)
+    TP1_FRAC    = 0.40        # v4 (was 0.50 in v5)
+    TP2_FRAC    = 0.30        # v4 (was 0.20 in v5)
+    # TP3_FRAC implicit = 1 - TP1_FRAC - TP2_FRAC = 0.30
 
-    # 🟢 v7 Fix J-2: env-tunable. Default 72 bars (6h) — was 36 (3h), too tight
-    # for live strategy. Override per-VPS via MAX_HOLD_BARS env var.
-    # Each bar = one 5-minute candle (one main loop tick).
-    MAX_HOLD    = int(os.getenv("MAX_HOLD_BARS", "72"))
+    # 🟢 v7 Fix J-2 retained — env-tunable. v8 default: 48 bars (4h) = v4 value.
+    # Override per-VPS via MAX_HOLD_BARS env var. Each bar = 5-min candle.
+    MAX_HOLD    = int(os.getenv("MAX_HOLD_BARS", "48"))
     IC          = 10_000.0    # initial capital (virtual tracking)
     RISK_PCT    = 0.01        # 🔴 RISK: 1.0% risk per trade
 
@@ -485,9 +486,13 @@ def get_signal(d5, capital):
     if ar is None or ar < Cfg.ATR_REL:
         return {"sig": "CHOP", "reason": f"ATR {ar:.2f}x<{Cfg.ATR_REL:.2f}x" if ar else "ATR N/A", "m": m}
 
-    # ── Session filter (v3) ──────────────────────────────────────
-    if not (Cfg.SESSION_START <= hour < Cfg.SESSION_END):
-        return {"sig": "WATCH", "reason": f"off-session {hour}:xx UTC", "m": m}
+    # ── Session filter — DISABLED for 24/7 trading (v8 Fix K) ────
+    # v4 had 07:00–20:00 UTC. v5 expanded 06:00–22:00. v8 removes the
+    # gate entirely per trader request. The pre-gate is preserved as a
+    # comment for easy re-enable, and Cfg.SESSION_* constants kept as
+    # sentinels (0, 24) so any other reference still parses.
+    # if not (Cfg.SESSION_START <= hour < Cfg.SESSION_END):
+    #     return {"sig": "WATCH", "reason": f"off-session {hour}:xx UTC", "m": m}
 
     # ── Candle quality ───────────────────────────────────────────
     rng  = h - l
@@ -501,32 +506,34 @@ def get_signal(d5, capital):
     tr_d = "UP" if d5["tf_up"][i] else ("DOWN" if d5["tf_dn"][i] else "FLAT")
     m["tr"] = tr_d  # expose 15M trend to log display (was missing — caused 15M:? in logs)
 
-    # ── Gate-by-gate evaluation (v6 verbose diagnostics) ─────────
-    # v6 RSI change: zone-based instead of single-bar cross.
-    # Old LONG: rp < RSI_LO AND rc > rp  (exact cross-bar — rarely fires)
-    # New LONG: rc < RSI_LO+5 AND rsi_rise  (RSI in pullback zone AND rising)
-    # Old SHORT: rp > RSI_HI AND rc < rp  (exact cross-bar)
-    # New SHORT: rc > RSI_HI-5 AND rsi_fall  (RSI in overbought zone AND falling)
+    # ── Gate-by-gate evaluation (v8 Fix K: REVERTED to v4 RSI) ───
+    # v4 pattern: exact cross-bar (`rp < RSI_LO AND rc > rp`) AND
+    # 2-bar momentum (rsi_rising / rsi_falling). Strict — few signals
+    # per day but those are textbook pullback-bottoms in trend.
+    #
+    # Prior versions:
+    #   v6:  zone-based  (rc < RSI_LO+5 AND rsi_rise)  — loose
+    #   v4:  cross-bar   (rp < RSI_LO AND rc > rp AND rsi_rise) — strict
     rsi_1h_ok_long  = rsi_1h is None or rsi_1h > Cfg.RSI_1H_LO
     rsi_1h_ok_short = rsi_1h is None or rsi_1h < Cfg.RSI_1H_HI
 
     lg = {
-        "15M-UP":                        d5["tf_up"][i],
-        f"dist<{Cfg.PULL_PCT*100:.1f}%": near,
-        f"RSI<{Cfg.RSI_LO+5:.0f}":       rc < Cfg.RSI_LO + 5,
-        f"RSI>fl{Cfg.RSI_FLOOR:.0f}":    rc > Cfg.RSI_FLOOR,
-        "bull-body":                     bull,
-        "rsi-rising":                    rsi_rise,
-        f"1H>{Cfg.RSI_1H_LO:.0f}":       rsi_1h_ok_long,
+        "15M-UP":                            d5["tf_up"][i],
+        f"dist<{Cfg.PULL_PCT*100:.1f}%":     near,
+        f"RSI-cross<{Cfg.RSI_LO:.0f}":       rp < Cfg.RSI_LO and rc > rp,
+        f"RSI>fl{Cfg.RSI_FLOOR:.0f}":        rc > Cfg.RSI_FLOOR,
+        "bull-body":                         bull,
+        "rsi-rising":                        rsi_rise,
+        f"1H>{Cfg.RSI_1H_LO:.0f}":           rsi_1h_ok_long,
     }
     sg = {
-        "15M-DN":                        d5["tf_dn"][i],
-        f"dist<{Cfg.PULL_PCT*100:.1f}%": near,
-        f"RSI>{Cfg.RSI_HI-5:.0f}":       rc > Cfg.RSI_HI - 5,
-        f"RSI<cl{Cfg.RSI_CEIL:.0f}":     rc < Cfg.RSI_CEIL,
-        "bear-body":                     bear,
-        "rsi-falling":                   rsi_fall,
-        f"1H<{Cfg.RSI_1H_HI:.0f}":       rsi_1h_ok_short,
+        "15M-DN":                            d5["tf_dn"][i],
+        f"dist<{Cfg.PULL_PCT*100:.1f}%":     near,
+        f"RSI-cross>{Cfg.RSI_HI:.0f}":       rp > Cfg.RSI_HI and rc < rp,
+        f"RSI<cl{Cfg.RSI_CEIL:.0f}":         rc < Cfg.RSI_CEIL,
+        "bear-body":                         bear,
+        "rsi-falling":                       rsi_fall,
+        f"1H<{Cfg.RSI_1H_HI:.0f}":           rsi_1h_ok_short,
     }
 
     # ── LONG signal ──────────────────────────────────────────────
@@ -1034,6 +1041,47 @@ def execute_partial_tp(sym: str, ot: dict, tp_level: str, fraction: float) -> bo
     return True
 
 
+def _post_partial_sl_rearm(sym: str, ot: dict, ctx: str) -> None:
+    """🟢 v8 Fix K (C-5): after partial-TP, re-arm SL with the new remaining qty.
+
+    Background: v8 switched SL from closePosition STOP_MARKET to reduceOnly
+    STOP_LIMIT. closePosition auto-tracked position size; reduceOnly does
+    not. Without this re-arm the SL on Binance still carries the original
+    full qty — reduceOnly caps the fill at remaining position size so no
+    over-close happens, but precision quirks and partial-fill edge cases
+    (especially in fast moves) can leave the SL behaving unexpectedly.
+
+    Best-effort: any failure here logs and continues. The original SL
+    remains live; the new SL is purely a sizing refinement.
+    """
+    try:
+        new_rem_qty = float(ot.get("size", 0)) * float(ot.get("rem", 0))
+        if new_rem_qty <= 0:
+            log.info(f"{sym} {ctx}: rem qty is 0 — nothing to re-arm")
+            return
+        rearm = executor.move_stop_loss(
+            symbol=sym,
+            direction=ot["dir"],
+            new_sl_price=ot["sl"],
+            remaining_qty=new_rem_qty,
+        )
+        if rearm.get("success"):
+            new_id = rearm.get("sl_order_id")
+            if new_id:
+                ot["exec_sl_id"] = new_id
+            log.info(
+                f"{sym} {ctx}: SL re-armed with qty={new_rem_qty:.6f} "
+                f"(new id={new_id})"
+            )
+        else:
+            log.warning(
+                f"{sym} {ctx}: SL re-arm failed: {rearm.get('error')!r} "
+                f"— original SL remains; reduceOnly will cap fill at remaining"
+            )
+    except Exception as e:
+        log.warning(f"{sym} {ctx}: SL re-arm raised: {e}")
+
+
 def execute_breakeven(sym: str, ot: dict) -> None:
     """Move the server-side stop-loss to breakeven (entry price).
 
@@ -1472,9 +1520,19 @@ def main():
                             if ev.startswith("TP1"):
                                 if execute_partial_tp(sym, ot, "TP1", Cfg.TP1_FRAC):
                                     tg_tp_hit(sym, ot, "TP1")
+                                    # 🟢 v8 Fix K (C-5): re-arm SL with new remaining qty
+                                    # after partial-TP. closePosition used to auto-resize;
+                                    # STOP_LIMIT+reduceOnly does not. Without this re-arm,
+                                    # the SL on Binance still carries the original qty,
+                                    # which reduceOnly caps at remaining position at fill
+                                    # but causes edge cases (precision quirks, partial fills
+                                    # of SL itself in fast-move scenarios). Best-effort —
+                                    # failure logs but does not block trade flow.
+                                    _post_partial_sl_rearm(sym, ot, "post-TP1")
                             elif ev.startswith("TP2"):
                                 if execute_partial_tp(sym, ot, "TP2", Cfg.TP2_FRAC):
                                     tg_tp_hit(sym, ot, "TP2")
+                                    _post_partial_sl_rearm(sym, ot, "post-TP2")
                             elif ev.startswith("TP3"):
                                 # TP3 = full close, handled below
                                 tg_tp_hit(sym, ot, "TP3")
