@@ -98,9 +98,9 @@ check("STOP_MARKET fallback present",
       "STOP_MARKET" in exec_src,
       "dust-position close fallback for sub-minimum lot sizes is missing")
 
-check("closePosition=True param in fallback",
-      '"closePosition": True' in exec_src or "'closePosition': True" in exec_src,
-      "closePosition=True required to close dust positions regardless of qty")
+check("v8 Fix K: closePosition wrapper retained for legacy callers",
+      "closePosition wrapper" in exec_src,
+      "v8 Fix K: closePosition STOP_MARKET retired; wrapper now forwards to STOP_LIMIT helper")
 
 check("reduceOnly present (partial TP closes)",
       "reduceOnly" in exec_src,
@@ -200,10 +200,10 @@ check("bot.py stores S[live_equity]",
 # ─────────────────────────────────────────────
 print("\n[4b] v4 SL verify-fail fixes")
 
-# Fix A — trust-id branch in BOTH retry helpers (count must be >=2)
-check("v4 Fix A: TRUSTING id present in BOTH executor helpers",
-      exec_src.count("TRUSTING id") >= 2,
-      "trust-id rescue path must exist in reduceOnly + closePosition helpers")
+# Fix A — trust-id branch present (v8: consolidated into single helper — count >=1)
+check("v4 Fix A: TRUSTING id rescue path present",
+      "TRUSTING id" in exec_src,
+      "v4 Fix A trust-id rescue must exist (v8: consolidated into STOP_LIMIT helper)")
 
 check("v4 Fix A: sl_unverified flag set in executor",
       "sl_unverified" in exec_src and '"sl_unverified": True' in exec_src,
@@ -213,10 +213,10 @@ check("v4 Fix A: sl_unverified propagated through open_position",
       'result["sl_unverified"] = True' in exec_src,
       "open_position must propagate sl_unverified to caller")
 
-# Fix B — diag wrapped in try/except (count must be >=2)
-check("v4 Fix B: diag wrapped in try/except in BOTH helpers",
-      exec_src.count("diag raised") >= 2,
-      "_diagnose_sl_verify_fail call must be try-wrapped in both retry helpers")
+# Fix B — diag wrapped in try/except (v8: consolidated — count >=1)
+check("v4 Fix B: diag wrapped in try/except",
+      "diag raised" in exec_src,
+      "_diagnose_sl_verify_fail call must be try-wrapped (v8: consolidated into STOP_LIMIT helper)")
 
 # Fix C / v5 Fix H — verify defaults bumped (v4: 15/0.6 → v5: 20/0.5 = 10s budget)
 check("v5 Fix H: max_polls=20 default in _verify_sl_placed",
@@ -310,21 +310,21 @@ check("v5 Fix H: bot.py calls _final_sl_lost_check on grace-end + unknown",
 # ─────────────────────────────────────────────
 # v6 Fix I — kill UNVERIFIED alert at the source (skip-verify-on-NEW)
 # ─────────────────────────────────────────────
-check("v6 Fix I: closePosition path has fast-path skip-verify",
-      exec_src.count("fast-path skip verify") >= 2,
-      "both placement helpers must short-circuit verify when create_order acks NEW/ACCEPTED")
+check("v6 Fix I: fast-path skip-verify present (v8: consolidated)",
+      "fast-path skip verify" in exec_src,
+      "STOP_LIMIT helper must short-circuit verify when create_order acks NEW/ACCEPTED")
 
-check("v6 Fix I: fast_path marker flag returned from helpers",
-      exec_src.count('"fast_path": True') >= 2,
-      "both placement helpers must surface fast_path=True so bot.py can tighten cadence")
+check("v6 Fix I: fast_path marker flag returned from helper (v8: consolidated)",
+      '"fast_path": True' in exec_src,
+      "STOP_LIMIT helper must surface fast_path=True so bot.py can tighten cadence")
 
 check("v6 Fix I: bot.py reads fast_path to tighten first re-verify cadence",
       "fast_path" in bot_src and "+20s" in bot_src,
       "execute_entry must tighten first re-verify to 20s on fast-path trades")
 
-check("v6 Fix I: tg_sl_unverified call-sites unchanged (fast-path adds none)",
-      exec_src.count("tg_sl_unverified(symbol") == 2,
-      "exactly 2 call-sites must remain — one per placement helper's empty-status fallback")
+check("v6 Fix I: tg_sl_unverified call-site present (v8: consolidated to 1)",
+      exec_src.count("tg_sl_unverified(symbol") >= 1,
+      "STOP_LIMIT helper's empty-status fallback must still fire Telegram alert")
 
 # ─────────────────────────────────────────────
 # v7 Fix J — kill premature TIME-labeled closes
@@ -344,6 +344,77 @@ check("v7 Fix J-3: verify_existing_sl distinguishes pos=None from qty<=0",
 check("v7 Fix J-4: _final_sl_lost_check distinguishes pos=None from qty<=0",
       "do NOT default to 'flat'" in exec_src,
       "final-check flat decision must require positive position fetch")
+
+# ─────────────────────────────────────────────
+# v8 Fix K — strategy revert to v4 + STOP_LIMIT SL with bracket
+# ─────────────────────────────────────────────
+check("v8 Fix K: PULL_PCT reverted to v4 0.5%",
+      "PULL_PCT    = 0.005" in bot_src,
+      "v4 pullback width")
+
+check("v8 Fix K: ATR_REL reverted to v4 0.70",
+      "ATR_REL     = 0.70" in bot_src,
+      "v4 chop filter")
+
+check("v8 Fix K: SL_MULT reverted to v4 1.8",
+      "SL_MULT     = 1.8" in bot_src,
+      "v4 SL distance")
+
+check("v8 Fix K: TP3_MULT reverted to v4 18.0",
+      "TP3_MULT    = 18.0" in bot_src,
+      "v4 TP3 distance")
+
+check("v8 Fix K: TP1_FRAC reverted to v4 0.40",
+      "TP1_FRAC    = 0.40" in bot_src,
+      "v4 TP1 fraction")
+
+check("v8 Fix K: TP2_FRAC reverted to v4 0.30",
+      "TP2_FRAC    = 0.30" in bot_src,
+      "v4 TP2 fraction")
+
+check("v8 Fix K: MAX_HOLD_BARS default reverted to 48",
+      'MAX_HOLD_BARS", "48"' in bot_src,
+      "v4 max hold 48 bars (4h)")
+
+check("v8 Fix K: 24/7 trading — session gate commented out",
+      "Session filter — DISABLED" in bot_src,
+      "session gate must be commented out for 24/7")
+
+check("v8 Fix K: RSI cross-bar pattern (LONG)",
+      "rp < Cfg.RSI_LO and rc > rp" in bot_src,
+      "v4 RSI gate uses exact cross-bar for LONG")
+
+check("v8 Fix K: RSI cross-bar pattern (SHORT)",
+      "rp > Cfg.RSI_HI and rc < rp" in bot_src,
+      "v4 RSI gate uses exact cross-bar for SHORT")
+
+check("v8 Fix K: STOP_LIMIT SL with type='stop' + bracket",
+      'type="stop"' in exec_src and "limit_buffer_pct" in exec_src,
+      "STOP_LIMIT order shape with 0.3% bracket")
+
+check("v8 Fix K: limit_buffer_pct default 0.003",
+      "limit_buffer_pct: float = 0.003" in exec_src,
+      "0.3% bracket buffer between trigger and limit price")
+
+check("v8 Fix K: closePosition helper delegates to reduceOnly STOP_LIMIT path",
+      "closePosition wrapper" in exec_src and "_place_reduceonly_sl_with_retry" in exec_src,
+      "closePosition path must forward to STOP_LIMIT helper")
+
+check("v8 Fix K: _order_matches_type has stop_limit case",
+      'expected_type == "stop_limit"' in exec_src,
+      "type matcher must recognize STOP_LIMIT for idempotency pre-check")
+
+check("v8 Fix K: post-partial SL re-arm helper",
+      "def _post_partial_sl_rearm" in bot_src,
+      "partial TP1/TP2 must re-arm SL with new qty")
+
+check("v8 Fix K: post-partial re-arm called after TP1",
+      "post-TP1" in bot_src,
+      "TP1 path must invoke re-arm")
+
+check("v8 Fix K: post-partial re-arm called after TP2",
+      "post-TP2" in bot_src,
+      "TP2 path must invoke re-arm")
 
 # ─────────────────────────────────────────────
 # 6. STRUCTURE SANITY
