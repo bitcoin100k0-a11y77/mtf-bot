@@ -388,13 +388,13 @@ check("v8 Fix K: RSI cross-bar pattern (SHORT)",
       "rp > Cfg.RSI_HI and rc < rp" in bot_src,
       "v4 RSI gate uses exact cross-bar for SHORT")
 
-check("v8 Fix K: STOP_LIMIT SL with type='stop' + bracket",
-      'type="stop"' in exec_src and "limit_buffer_pct" in exec_src,
-      "STOP_LIMIT order shape with 0.3% bracket")
+check("v9 Fix L: SL reverted to STOP_MARKET (was STOP_LIMIT in v8)",
+      'type="stop_market"' in exec_src,
+      "v9 reverts v8 STOP_LIMIT after live regression — back to v7 STOP_MARKET reduceOnly")
 
-check("v8 Fix K: limit_buffer_pct default 0.003",
-      "limit_buffer_pct: float = 0.003" in exec_src,
-      "0.3% bracket buffer between trigger and limit price")
+check("v9 Fix L: post-partial SL re-arm disabled",
+      "_post_partial_sl_rearm" in bot_src and "# _post_partial_sl_rearm" in bot_src,
+      "re-arm helper kept but call-sites commented out — STOP_MARKET reduceOnly oversize is benign")
 
 check("v8 Fix K: closePosition helper delegates to reduceOnly STOP_LIMIT path",
       "closePosition wrapper" in exec_src and "_place_reduceonly_sl_with_retry" in exec_src,
