@@ -1205,9 +1205,17 @@ def verify_existing_sl(symbol: str, sl_order_id: str, stop_price: float) -> dict
             )
         if attempt < 3:
             time.sleep(2.0)
+    # 🟢 v9 Fix L diagnostic: dump full raw info on 'unknown' so we can
+    # diagnose future false-positive emergency-closes. Past pattern showed
+    # transient API quirks returning empty status; v9 captures the full
+    # ccxt response shape so we can map any missing status code.
     log.warning(
-        f"verify_existing_sl({symbol},{sl_order_id}) inconclusive after 3 attempts "
-        f"— returning 'unknown' (last_status={last_status!r}, last_err={last_err!r})"
+        f"verify_existing_sl({symbol},{sl_order_id}) inconclusive after 3 "
+        f"attempts — returning 'unknown' (last_status={last_status!r}, "
+        f"last_err={last_err!r}, last_info_keys={list(last_info.keys())!r}, "
+        f"last_info_type={last_info.get('type')!r}, "
+        f"last_info_status={last_info.get('status')!r}, "
+        f"last_info_origType={last_info.get('origType')!r})"
     )
     return {
         "status_code": "unknown",
@@ -1367,21 +1375,22 @@ def _place_reduceonly_sl_with_retry(
     qty: float,
     max_attempts: int = 5,
     min_wait_after_cancel: float = 1.5,
-    limit_buffer_pct: float = 0.003,   # v8 Fix K: 0.3% bracket
 ) -> dict:
-    """🟢 v8 Fix K: reduceOnly STOP_LIMIT SL with 0.3% bracket.
+    """🟢 v9 Fix L: reduceOnly STOP_MARKET SL — reverts v8's STOP_LIMIT.
 
-    Was reduceOnly STOP_MARKET in v7. v8 switches to STOP_LIMIT (CCXT
-    type='stop') with a limit price 0.3% past the trigger. Binance fills the
-    SL at limit-or-better when the trigger hits; if price gaps past the
-    limit (flash crash), the limit sits unfilled — fallback is bot.py's
-    main-loop check_exits sl_hit detection which fires a reduceOnly MARKET
-    close on the next 5-min tick.
+    Background: v8 Fix K switched SL from STOP_MARKET → STOP_LIMIT with a
+    0.3% bracket. Live deployment surfaced a regression: SL_LOST alerts
+    returning after 90s grace with emergency closes on positions that
+    Binance still held. Most likely v8 cause: STOP_LIMIT pre-trigger
+    lifecycle reads differently in ccxt's `fetch_order` than STOP_MARKET,
+    confusing `verify_existing_sl`'s 4-state classifier and/or
+    `_final_sl_lost_check`'s type filter on the open_orders scan. v9
+    reverts SL execution to v7's known-good STOP_MARKET reduceOnly path
+    while keeping ALL v8 strategy reverts (v4 Cfg, 24/7, RSI cross-bar).
 
-    Trigger:      stopPrice == stop_price
-    Limit price:  LONG SL (sell) → stop_price × (1 − 0.003) (sell lower)
-                  SHORT SL (buy) → stop_price × (1 + 0.003) (buy higher)
-    Type label:   "stop_limit" (was "reduceOnly" in v7) — passed to verify.
+    reduceOnly STOP_MARKET bypasses Binance's closePosition tracker race
+    (-4130) and uses an independent ledger. Position fill_qty is known
+    exactly at placement so explicit qty is fine.
 
     Inherits all prior safety: v6 Fix I fast-path on order_known_active,
     v5 Fix H 4-state deferred re-verify, v7 Fix J close_reason preservation.
@@ -1391,22 +1400,14 @@ def _place_reduceonly_sl_with_retry(
     result: dict = {"success": False, "sl_order_id": None, "error": None}
     last_err: Optional[Exception] = None
 
-    # 🟢 v8 Fix K: compute limit price with 0.3% bracket
-    if sl_side == "sell":          # closing a LONG → sell lower than trigger
-        limit_price_raw = stop_price * (1.0 - limit_buffer_pct)
-    else:                          # closing a SHORT → buy higher than trigger
-        limit_price_raw = stop_price * (1.0 + limit_buffer_pct)
-    limit_price = _round_price(ccxt_sym, limit_price_raw)
-    stop_price  = _round_price(ccxt_sym, stop_price)
-
-    # Idempotency pre-check — stop_limit only, so stale closePosition at same
+    # Idempotency pre-check — reduceOnly only, so stale closePosition at same
     # price doesn't false-positive and skip the placement we actually want.
     existing_id = _sl_already_at(
-        symbol, sl_side, stop_price, expected_type="stop_limit"
+        symbol, sl_side, stop_price, expected_type="reduceOnly"
     )
     if existing_id:
         log.info(
-            f"{symbol} STOP_LIMIT SL already at target {stop_price} — "
+            f"{symbol} reduceOnly SL already at target {stop_price} — "
             f"skipping replace (id={existing_id})"
         )
         return {"success": True, "sl_order_id": existing_id, "error": None}
@@ -1415,32 +1416,25 @@ def _place_reduceonly_sl_with_retry(
         cancelled_clean = cancel_open_orders(symbol)
         wait = min_wait_after_cancel if cancelled_clean else max(min_wait_after_cancel, 2.0)
         log.info(
-            f"{symbol} STOP_LIMIT SL attempt {attempt}/{max_attempts}: "
+            f"{symbol} reduceOnly SL attempt {attempt}/{max_attempts}: "
             f"cancelled_clean={cancelled_clean}, waiting {wait:.2f}s"
         )
         time.sleep(wait)
 
         try:
-            params = {
-                "stopPrice": stop_price,
-                "reduceOnly": True,
-                "timeInForce": "GTC",
-                # NO closePosition — incompatible with STOP_LIMIT on Binance Futures
-            }
+            params = {"stopPrice": stop_price, "reduceOnly": True}
             ps = _position_side_for("LONG" if sl_side == "sell" else "SHORT")
             if ps:
                 params["positionSide"] = ps
             log.info(
                 f"PLACING SL (attempt {attempt}/{max_attempts}): "
-                f"{sl_side} STOP_LIMIT {ccxt_sym} qty={qty} "
-                f"stop={stop_price} limit={limit_price}"
+                f"{sl_side} reduceOnly {ccxt_sym} qty={qty} @ {stop_price}"
             )
             sl_order = ex.create_order(
                 symbol=ccxt_sym,
-                type="stop",          # 🟢 v8 Fix K: STOP_LIMIT (was stop_market)
+                type="stop_market",   # 🟢 v9 Fix L: revert to STOP_MARKET (was 'stop' STOP_LIMIT in v8)
                 side=sl_side,
                 amount=qty,
-                price=limit_price,    # 🟢 v8 Fix K: limit price (bracket)
                 params=params,
             )
             order_id = sl_order.get("id", "unknown")
@@ -1507,7 +1501,7 @@ def _place_reduceonly_sl_with_retry(
             # 🟢 NOTE (v6 Fix I): only reached on empty-status responses now.
             if not _verify_sl_placed(
                 symbol, sl_side, stop_price,
-                expected_type="stop_limit",   # 🟢 v8 Fix K: was "reduceOnly"
+                expected_type="reduceOnly",   # 🟢 v9 Fix L: revert (v8 used "stop_limit")
                 expected_id=order_id,
             ):
                 # 🔴 FIX ('verify-fail' Fix 3): diag fetch_order to find out
