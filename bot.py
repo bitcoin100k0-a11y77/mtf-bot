@@ -1520,19 +1520,21 @@ def main():
                             if ev.startswith("TP1"):
                                 if execute_partial_tp(sym, ot, "TP1", Cfg.TP1_FRAC):
                                     tg_tp_hit(sym, ot, "TP1")
-                                    # 🟢 v8 Fix K (C-5): re-arm SL with new remaining qty
-                                    # after partial-TP. closePosition used to auto-resize;
-                                    # STOP_LIMIT+reduceOnly does not. Without this re-arm,
-                                    # the SL on Binance still carries the original qty,
-                                    # which reduceOnly caps at remaining position at fill
-                                    # but causes edge cases (precision quirks, partial fills
-                                    # of SL itself in fast-move scenarios). Best-effort —
-                                    # failure logs but does not block trade flow.
-                                    _post_partial_sl_rearm(sym, ot, "post-TP1")
+                                    # 🟢 v9 Fix L: post-partial SL re-arm DISABLED.
+                                    # v8 Fix K introduced this for STOP_LIMIT precision
+                                    # but v9 reverts SL to STOP_MARKET reduceOnly, where
+                                    # the oversized-qty case is benign (reduceOnly caps
+                                    # at remaining position size at fill). The cancel-
+                                    # replace inside move_stop_loss carries a small
+                                    # naked-window risk that net-harms relative to the
+                                    # cosmetic sizing benefit. Helper retained for
+                                    # future re-enable; just don't invoke.
+                                    # _post_partial_sl_rearm(sym, ot, "post-TP1")
                             elif ev.startswith("TP2"):
                                 if execute_partial_tp(sym, ot, "TP2", Cfg.TP2_FRAC):
                                     tg_tp_hit(sym, ot, "TP2")
-                                    _post_partial_sl_rearm(sym, ot, "post-TP2")
+                                    # v9 Fix L: see TP1 comment above. Disabled.
+                                    # _post_partial_sl_rearm(sym, ot, "post-TP2")
                             elif ev.startswith("TP3"):
                                 # TP3 = full close, handled below
                                 tg_tp_hit(sym, ot, "TP3")
