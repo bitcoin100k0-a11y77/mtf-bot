@@ -396,6 +396,23 @@ check("v9 Fix L: post-partial SL re-arm disabled",
       "_post_partial_sl_rearm" in bot_src and "# _post_partial_sl_rearm" in bot_src,
       "re-arm helper kept but call-sites commented out — STOP_MARKET reduceOnly oversize is benign")
 
+# ─────────────────────────────────────────────
+# v10 Fix M — kill false-positive SL_LOST + fix TypeError bug
+# ─────────────────────────────────────────────
+check("v10 Fix M-0: every close_full_position call site has direction arg",
+      # All call sites must have 'sym, ot["dir"]' nearby OR multiline form
+      "close_full_position(sym)\n" not in bot_src
+      and "close_full_position(sym)" not in bot_src.replace("close_full_position(sym, ot", ""),
+      "every close_full_position(sym) call MUST pass ot[\"dir\"] — TypeError bug in v5-v9 sl_unverified branches")
+
+check("v10 Fix M-1: lost branch uses _final_sl_lost_check positive-evidence gate",
+      "M-1 _final_sl_lost_check" in bot_src,
+      "lost branch must demand positive evidence before emergency close — prevents false 'lost' on race")
+
+check("v10 Fix M-2: tg_sl_lost suppressed when close was no-op",
+      "SL_GHOST_RESOLVED" in bot_src and "close_no_op" in bot_src,
+      "if close_full_position returned fill_price=0.0, position already 0 — replace alarming SL_LOST with informational notice")
+
 check("v8 Fix K: closePosition helper delegates to reduceOnly STOP_LIMIT path",
       "closePosition wrapper" in exec_src and "_place_reduceonly_sl_with_retry" in exec_src,
       "closePosition path must forward to STOP_LIMIT helper")
