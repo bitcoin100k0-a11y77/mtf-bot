@@ -1350,7 +1350,7 @@ def main():
                                     f"— force close (kill-switch)"
                                 )
                                 try:
-                                    executor.close_full_position(sym)
+                                    executor.close_full_position(sym, ot["dir"])
                                 except Exception as ce:
                                     log.error(f"{sym} force close failed: {ce}")
                                 try:
@@ -1405,56 +1405,141 @@ def main():
                                         ot["close_reason"] = "SL_AUTO_CANCEL_CLEAN"
 
                                     elif code == "lost":
-                                        log.error(
-                                            f"{sym} SL truly LOST (id={sl_id}, "
-                                            f"status={chk.get('status')!r}) AND position "
-                                            f"still open — re-arming via move_stop_loss "
-                                            f"before any emergency close"
-                                        )
-                                        rearm_ok = False
+                                        # 🟢 v10 Fix M-1: positive-evidence gate BEFORE
+                                        # re-arm + emergency close. The 'lost' code came
+                                        # from verify_existing_sl seeing a DEAD fetch_order
+                                        # status + a single qty>0 reading. Race scenarios
+                                        # (stale position state, concurrent SL fill
+                                        # between fetch_order and fetch_positions, bot's
+                                        # own cancel-replace elsewhere) can yield a false
+                                        # 'lost'. Re-run _final_sl_lost_check (open_orders
+                                        # scan + fresh position + direct id lookup) to
+                                        # require positive evidence that SL is truly gone
+                                        # AND position is truly open before nuking.
                                         try:
-                                            rearm = executor.move_stop_loss(
-                                                symbol=sym,
-                                                direction=ot["dir"],
-                                                new_sl_price=ot["sl"],
-                                                remaining_qty=ot["size"],
+                                            m_decision = executor._final_sl_lost_check(
+                                                sym, sl_id, ot
                                             )
-                                            rearm_ok = bool(rearm.get("success"))
-                                            new_id = rearm.get("sl_order_id")
-                                        except Exception as re:
-                                            log.error(f"{sym} re-arm raised: {re}")
-                                            new_id = None
-                                        if rearm_ok and new_id:
-                                            log.warning(
-                                                f"{sym} SL re-armed via move_stop_loss "
-                                                f"— new id={new_id}"
+                                        except Exception as mfe:
+                                            log.error(
+                                                f"{sym} M-1 _final_sl_lost_check raised: "
+                                                f"{mfe} — defaulting to 'lost'"
                                             )
-                                            ot["exec_sl_id"] = new_id
+                                            m_decision = "lost"
+                                        log.error(
+                                            f"{sym} verify=lost "
+                                            f"(status={chk.get('status')!r}), "
+                                            f"final-check={m_decision} (id={sl_id})"
+                                        )
+
+                                        if m_decision == "alive":
+                                            log.info(
+                                                f"{sym} lost-branch override — SL alive "
+                                                f"per final-check (other id on book?), "
+                                                f"silent resolve"
+                                            )
                                             ot.pop("sl_unverified_until", None)
                                             ot.pop("sl_unverified_last_check", None)
                                             try:
-                                                tg_sl_resolved(sym, new_id)
+                                                tg_sl_resolved(sym, sl_id)
                                             except Exception:
                                                 pass
-                                        else:
-                                            log.error(
-                                                f"{sym} SL re-arm FAILED — falling "
-                                                f"through to emergency close"
+
+                                        elif m_decision == "flat":
+                                            log.warning(
+                                                f"{sym} lost-branch override — position "
+                                                f"flat per final-check, silent resolve "
+                                                f"(SL fired or closed elsewhere)"
                                             )
-                                            try:
-                                                executor.close_full_position(sym)
-                                            except Exception as ce:
-                                                log.error(
-                                                    f"{sym} emergency close failed: {ce}"
-                                                )
-                                            try:
-                                                tg_sl_lost(sym, sl_id)
-                                            except Exception:
-                                                pass
+                                            ot.pop("sl_unverified_until", None)
+                                            ot.pop("sl_unverified_last_check", None)
                                             ot["bars"] = max(
                                                 ot.get("bars", 0), Cfg.MAX_HOLD
                                             )
-                                            ot["close_reason"] = "SL_LOST"
+                                            ot["close_reason"] = "SL_AUTO_CANCEL_CLEAN"
+
+                                        else:
+                                            # Confirmed lost: SL truly gone, position
+                                            # truly open. Re-arm + emergency close.
+                                            log.error(
+                                                f"{sym} SL CONFIRMED LOST — re-arming "
+                                                f"via move_stop_loss"
+                                            )
+                                            rearm_ok = False
+                                            new_id = None
+                                            try:
+                                                rearm = executor.move_stop_loss(
+                                                    symbol=sym,
+                                                    direction=ot["dir"],
+                                                    new_sl_price=ot["sl"],
+                                                    remaining_qty=ot["size"],
+                                                )
+                                                rearm_ok = bool(rearm.get("success"))
+                                                new_id = rearm.get("sl_order_id")
+                                            except Exception as re:
+                                                log.error(
+                                                    f"{sym} re-arm raised: {re}"
+                                                )
+                                            if rearm_ok and new_id:
+                                                log.warning(
+                                                    f"{sym} SL re-armed via "
+                                                    f"move_stop_loss — new id={new_id}"
+                                                )
+                                                ot["exec_sl_id"] = new_id
+                                                ot.pop("sl_unverified_until", None)
+                                                ot.pop("sl_unverified_last_check", None)
+                                                try:
+                                                    tg_sl_resolved(sym, new_id)
+                                                except Exception:
+                                                    pass
+                                            else:
+                                                # 🟢 v10 Fix M-2: inspect close result.
+                                                # If close was no-op (position already
+                                                # 0), suppress alarming SL_LOST telegram
+                                                # — replace with informational notice.
+                                                close_ok = False
+                                                close_no_op = False
+                                                try:
+                                                    close_res = executor.close_full_position(
+                                                        sym, ot["dir"]
+                                                    )
+                                                    close_ok = bool(close_res.get("success"))
+                                                    fp = close_res.get("fill_price")
+                                                    close_no_op = (
+                                                        close_ok
+                                                        and (fp == 0.0 or fp is None)
+                                                    )
+                                                except Exception as ce:
+                                                    log.error(
+                                                        f"{sym} emergency close failed: {ce}"
+                                                    )
+                                                if close_no_op:
+                                                    log.warning(
+                                                        f"{sym} emergency close NO-OP "
+                                                        f"(position already 0) — "
+                                                        f"suppressing SL_LOST telegram"
+                                                    )
+                                                    try:
+                                                        tg(
+                                                            f"<b>ℹ️ {sym} SL state "
+                                                            f"resolved</b>\n"
+                                                            f"id={sl_id} verify returned "
+                                                            f"lost but position was "
+                                                            f"already closed. No emergency "
+                                                            f"action needed."
+                                                        )
+                                                    except Exception:
+                                                        pass
+                                                    ot["close_reason"] = "SL_GHOST_RESOLVED"
+                                                else:
+                                                    try:
+                                                        tg_sl_lost(sym, sl_id)
+                                                    except Exception:
+                                                        pass
+                                                    ot["close_reason"] = "SL_LOST"
+                                                ot["bars"] = max(
+                                                    ot.get("bars", 0), Cfg.MAX_HOLD
+                                                )
 
                                     elif code == "unknown" and now_ts > ot["sl_unverified_until"]:
                                         # Grace expired AND verifier still inconclusive.
@@ -1492,24 +1577,57 @@ def main():
                                             )
                                             ot["close_reason"] = "ALREADY_FLAT"
                                         else:
+                                            # 🟢 v10 Fix M-2: inspect close result. If
+                                            # no-op (position already 0), suppress the
+                                            # alarming SL_LOST telegram — replace with
+                                            # informational notice.
                                             log.error(
                                                 f"{sym} final-check confirms SL lost "
                                                 f"— emergency close (id={sl_id})"
                                             )
+                                            close_ok = False
+                                            close_no_op = False
                                             try:
-                                                executor.close_full_position(sym)
+                                                close_res = executor.close_full_position(
+                                                    sym, ot["dir"]
+                                                )
+                                                close_ok = bool(close_res.get("success"))
+                                                fp = close_res.get("fill_price")
+                                                close_no_op = (
+                                                    close_ok
+                                                    and (fp == 0.0 or fp is None)
+                                                )
                                             except Exception as ce:
                                                 log.error(
                                                     f"{sym} emergency close failed: {ce}"
                                                 )
-                                            try:
-                                                tg_sl_lost(sym, sl_id)
-                                            except Exception:
-                                                pass
+                                            if close_no_op:
+                                                log.warning(
+                                                    f"{sym} emergency close NO-OP "
+                                                    f"(position already 0) — "
+                                                    f"suppressing SL_LOST telegram"
+                                                )
+                                                try:
+                                                    tg(
+                                                        f"<b>ℹ️ {sym} SL state "
+                                                        f"resolved</b>\n"
+                                                        f"id={sl_id} final-check "
+                                                        f"declared lost but position "
+                                                        f"was already closed. No "
+                                                        f"emergency action needed."
+                                                    )
+                                                except Exception:
+                                                    pass
+                                                ot["close_reason"] = "SL_GHOST_RESOLVED"
+                                            else:
+                                                try:
+                                                    tg_sl_lost(sym, sl_id)
+                                                except Exception:
+                                                    pass
+                                                ot["close_reason"] = "SL_LOST"
                                             ot["bars"] = max(
                                                 ot.get("bars", 0), Cfg.MAX_HOLD
                                             )
-                                            ot["close_reason"] = "SL_LOST"
                                     # else: code == 'unknown' AND still inside grace
                                     # window ⇒ wait for next 60s tick. No-op.
 
