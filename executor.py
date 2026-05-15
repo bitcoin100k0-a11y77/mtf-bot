@@ -995,8 +995,18 @@ def _order_matches_type(order: dict, expected_type: Optional[str]) -> bool:
             return True  # defensive — assume legacy match
         return cp
     if expected_type == "reduceOnly":
+        # 🟢 v11.1 fix #1 (code-review): if `closePosition=True` is
+        # explicitly set, this is the v11 O-6 deadman SL, NOT the primary
+        # reduceOnly SL — reject. Previously the defensive `return True`
+        # on missing `reduceOnly` key would false-match the deadman after
+        # a BE move (when primary SL price drifts within 0.2% of the 5%
+        # deadman level), causing verify_existing_sl attribute scan to
+        # treat deadman as primary-alive → silent loss of primary
+        # protection.
+        if has_cp_key and cp:
+            return False
         if not has_ro_key:
-            return True  # defensive — assume legacy match
+            return True  # defensive — assume legacy match (only when no cp evidence)
         return ro and not cp
     if expected_type == "stop_limit":
         # 🟢 v8 Fix K: STOP_LIMIT specifically — raw type 'STOP' (Binance's
@@ -2073,9 +2083,38 @@ def move_stop_loss(
             )
         result["success"]     = sl_result["success"]
         result["sl_order_id"] = sl_result["sl_order_id"]
+        result["sl_client_oid"] = sl_result.get("sl_client_oid")
         result["error"]       = sl_result["error"]
         if sl_result["success"]:
             log.info(f"SL moved to {sl_px} (order: {sl_result['sl_order_id']})")
+            # 🟢 v11.1 fix #4: re-place deadman backup SL after every
+            # successful move_stop_loss. The cancel_open_orders() inside
+            # _place_reduceonly_sl_with_retry's retry loop wiped any
+            # prior deadman, so without this re-placement BE moves leave
+            # the position with no catastrophic-move safety net — the
+            # exact moment deadman protection matters most.
+            try:
+                # New deadman at 5% beyond the freshly-moved primary SL.
+                deadman_pct = 0.05
+                if direction == "LONG":
+                    deadman_stop = _round_price(ccxt_sym, sl_px * (1.0 - deadman_pct))
+                else:
+                    deadman_stop = _round_price(ccxt_sym, sl_px * (1.0 + deadman_pct))
+                new_deadman_id = _place_deadman_sl(
+                    symbol, sl_side, deadman_stop, direction, remaining_qty
+                )
+                if new_deadman_id:
+                    result["deadman_sl_id"] = new_deadman_id
+                    log.info(
+                        f"{symbol} DEADMAN SL re-placed after move: "
+                        f"id={new_deadman_id} stop={deadman_stop} "
+                        f"(new primary @ {sl_px}, +5% buffer)"
+                    )
+            except Exception as dme:
+                log.warning(
+                    f"{symbol} DEADMAN SL re-place raised: {dme} "
+                    f"— primary SL still active"
+                )
         else:
             log.error(f"SL move failed: {sl_result['error']}")
     except Exception as e:
