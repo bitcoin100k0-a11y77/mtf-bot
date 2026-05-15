@@ -1290,27 +1290,37 @@ def main():
             reconcile_open_trades(S)
             cleanup_orphan_sl_orders(S)  # 🔴 FIX: cancel stale SLs + re-place fresh ones
 
-            # 🟢 v11 Fix O-3: validate hedge-mode setting against fresh
-            # Binance probe + current position state. Likely root-cause
-            # of the SL_LOST cascade is a cached `_HEDGE_MODE=False` on
-            # an actual hedge-mode account → all orders placed without
-            # positionSide → Binance silently rejects post-ack → stored
-            # sl_id returns -2013 within 90s. Fail loud at startup so
-            # user can reconfigure account before trading.
+            # 🟢 v11 Fix O-3 + v11.1 fix #3: validate hedge-mode setting
+            # against fresh Binance probe + current position state.
+            # On confirmed mismatch (ok=False), TRIP CIRCUIT BREAKER —
+            # do NOT proceed to trade. Previously this only warned and
+            # continued, which left the door open for the exact failure
+            # mode O-3 was designed to catch.
+            # On drift (cache corrected), continue normally — drift is
+            # self-healing.
             try:
                 _vps = executor.validate_position_side(PAIRS[0] if PAIRS else "BTCUSDT")
                 log.info(f"O-3 validate_position_side: {_vps}")
                 if not _vps.get("ok"):
                     log.critical(
-                        f"O-3 hedge-mode mismatch detected: {_vps.get('detail')!r}"
+                        f"O-3 hedge-mode MISMATCH — halting trading: "
+                        f"{_vps.get('detail')!r}"
+                    )
+                    # Trip circuit breaker so circuit_breaker.is_tripped()
+                    # blocks all entries until env CIRCUIT_BREAKER_RESET=true
+                    # and bot restart.
+                    executor.circuit_breaker.tripped = True
+                    executor.circuit_breaker.trip_reason = (
+                        f"O-3 hedge-mode mismatch: {_vps.get('detail')}"
                     )
                     try:
                         tg(
-                            f"<b>⚠️ HEDGE MODE MISMATCH</b>\n"
+                            f"<b>🛑 HEDGE MODE MISMATCH — TRADING HALTED</b>\n"
                             f"{_vps.get('detail')}\n\n"
-                            f"Bot will continue but SL placements may "
-                            f"silently fail. Reconfigure Binance "
-                            f"positionMode and restart."
+                            f"Bot circuit-breaker tripped. New entries "
+                            f"blocked. Reconfigure Binance positionMode "
+                            f"on this account, then restart bot with "
+                            f"CIRCUIT_BREAKER_RESET=true env var."
                         )
                     except Exception:
                         pass
@@ -1382,14 +1392,26 @@ def main():
                     # ── Exit check ─────────────────────────────────
                     ot = S["open_trades"].get(sym)
                     if ot:
-                        # 🟢 v11 Fix O-7: ACTIVE SL LIVENESS PING for every
-                        # open trade (not just sl_unverified). Once per
-                        # 5-min cycle, check the primary SL is still on
-                        # book. Catches silent Binance cancellations
-                        # within 5 min instead of waiting 90s grace.
+                        # 🟢 v11 Fix O-7 + v11.1 fix #2: ACTIVE SL LIVENESS
+                        # PING throttled to one call per 300s per trade.
+                        # Without the throttle, a -2013 retry in
+                        # verify_existing_sl (up to 22s budget with O-4
+                        # 10s backoff) could span a loop boundary and
+                        # double-fire move_stop_loss in the same cycle,
+                        # potentially canceling a just-placed SL via
+                        # _place_reduceonly_sl_with_retry's
+                        # cancel_open_orders at top of placement.
                         # Skipped when sl_unverified_until is set (that
-                        # path already runs its own re-verify below).
-                        if not ot.get("sl_unverified_until") and ot.get("exec_sl_id"):
+                        # path already runs its own 60s re-verify below).
+                        _now_ts_ping = time.time()
+                        _last_ping = ot.get("last_liveness_ping", 0)
+                        _ping_due = (_now_ts_ping - _last_ping) >= 300.0
+                        if (
+                            not ot.get("sl_unverified_until")
+                            and ot.get("exec_sl_id")
+                            and _ping_due
+                        ):
+                            ot["last_liveness_ping"] = _now_ts_ping
                             try:
                                 _ping = executor.verify_existing_sl(
                                     sym,
