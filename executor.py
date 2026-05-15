@@ -94,13 +94,18 @@ def _get_exchange():
 _HEDGE_MODE: Optional[bool] = None
 
 
-def _get_hedge_mode() -> bool:
+def _get_hedge_mode(force_reprobe: bool = False) -> bool:
     """Detect whether the Futures account runs in Hedge Mode (dualSidePosition).
 
     Cached after first successful probe. Defaults to False on probe failure so
     that orders placed without positionSide continue to work for one-way accounts.
+
+    🟢 v11 Fix O-3: pass `force_reprobe=True` to bypass the cache. Used by
+    validate_position_side() to re-confirm after a placement looks suspicious.
     """
     global _HEDGE_MODE
+    if force_reprobe:
+        _HEDGE_MODE = None
     if _HEDGE_MODE is None:
         try:
             ex = _get_exchange()
@@ -122,6 +127,104 @@ def _position_side_for(direction: str) -> Optional[str]:
     if not _get_hedge_mode():
         return None
     return "LONG" if direction == "LONG" else "SHORT"
+
+
+def validate_position_side(symbol: str = "BTCUSDT") -> dict:
+    """🟢 v11 Fix O-3: hedge-mode mismatch fail-fast.
+
+    Live root-cause hypothesis: cached `_HEDGE_MODE=False` (because the
+    initial probe failed at boot) on an account that ACTUALLY is in hedge
+    mode (`dualSidePosition=True`). All orders then go without
+    `positionSide` field → Binance accepts (returns id) then internally
+    rejects/cancels because hedge mode requires `positionSide`. The
+    stored sl_id later returns -2013 "Order does not exist" because the
+    order never persisted.
+
+    This helper:
+      1. Forces re-probe of `fapiPrivateGetPositionSideDual`
+      2. Checks any current position's `positionSide` field — if account
+         is dual-side but a position shows `BOTH`, there's a config drift
+      3. Returns a structured result:
+            {"ok": bool, "hedge": bool, "drift": bool, "detail": str}
+
+    Caller (bot.py main()) should:
+      - On `ok=False`: log CRITICAL, send Telegram alert, halt new entries
+      - On `drift=True`: log warning + force re-probe but continue
+
+    Idempotent. Safe to call repeatedly. No side effects beyond log lines.
+    """
+    global _HEDGE_MODE
+    result = {"ok": True, "hedge": False, "drift": False, "detail": ""}
+    try:
+        ex = _get_exchange()
+        # Force-reprobe: bypass cache to get fresh hedge mode setting
+        probe = getattr(ex, "fapiPrivateGetPositionSideDual", None)
+        if not probe:
+            result["detail"] = "fapiPrivateGetPositionSideDual unavailable on this ccxt version"
+            log.warning(f"validate_position_side: {result['detail']}")
+            return result
+
+        resp = probe()
+        fresh_hedge = bool(resp.get("dualSidePosition", False))
+        cached_hedge = _HEDGE_MODE
+        result["hedge"] = fresh_hedge
+
+        # Update cache to truth
+        if cached_hedge != fresh_hedge:
+            log.critical(
+                f"validate_position_side: HEDGE MODE CACHE MISMATCH — "
+                f"cached={cached_hedge} fresh={fresh_hedge}. Updating cache."
+            )
+            _HEDGE_MODE = fresh_hedge
+            result["drift"] = True
+            result["detail"] = (
+                f"hedge mode cache was {cached_hedge}, real value is {fresh_hedge}"
+            )
+
+        # Sanity-check current positions vs hedge setting
+        try:
+            ccxt_sym = _symbol_to_ccxt(symbol)
+            positions = ex.fetch_positions([ccxt_sym])
+            for pos in positions:
+                qty = abs(float(pos.get("contracts", 0)))
+                if qty <= 0:
+                    continue
+                info = pos.get("info") or {}
+                pos_side = info.get("positionSide", "")
+                if fresh_hedge and pos_side == "BOTH":
+                    result["ok"] = False
+                    result["detail"] = (
+                        f"HEDGE MISMATCH: account is dualSidePosition=True but "
+                        f"position {symbol} has positionSide=BOTH. Orders will "
+                        f"be silently rejected. Reconfigure account."
+                    )
+                    log.critical(f"validate_position_side: {result['detail']}")
+                    return result
+                if not fresh_hedge and pos_side in ("LONG", "SHORT"):
+                    result["ok"] = False
+                    result["detail"] = (
+                        f"HEDGE MISMATCH: account is one-way (dualSidePosition=False) "
+                        f"but position {symbol} has positionSide={pos_side}. "
+                        f"Reconfigure account."
+                    )
+                    log.critical(f"validate_position_side: {result['detail']}")
+                    return result
+        except Exception as pe:
+            log.warning(
+                f"validate_position_side: position sanity-check raised: {pe} "
+                f"(non-fatal; ok={result['ok']})"
+            )
+
+        log.info(
+            f"validate_position_side: ok={result['ok']} hedge={fresh_hedge} "
+            f"drift={result['drift']}"
+        )
+        return result
+    except Exception as e:
+        result["ok"] = False
+        result["detail"] = f"validate_position_side raised: {e}"
+        log.error(f"validate_position_side fatal: {e}")
+        return result
 
 
 def _init_leverage(symbol: str) -> None:
@@ -474,10 +577,45 @@ def open_position(
 
     if sl_result["success"]:
         result["sl_order_id"] = sl_result["sl_order_id"]
+        # 🟢 v11 Fix O-1: propagate clientOrderId so bot.py can use it as
+        # fallback identifier when orderId returns -2013 in verify path.
+        result["sl_client_oid"] = sl_result.get("sl_client_oid")
         # 🟢 FIX (v4 Fix A): propagate sl_unverified flag to caller.
         # bot.py reads this to schedule a 60s re-verify (Fix F).
         if sl_result.get("sl_unverified"):
             result["sl_unverified"] = True
+
+        # 🟢 v11 Fix O-6: place DEADMAN-SWITCH backup SL at 5% beyond primary.
+        # If Binance loses the primary SL (the -2013 root-cause path), the
+        # deadman fires on catastrophic move and closes the position via
+        # closePosition=True (auto-sizes to current position).
+        # closePosition auto-cancels server-side when position size → 0,
+        # so deadman doesn't linger after a clean primary-SL hit.
+        try:
+            deadman_pct = 0.05  # 5% beyond primary
+            if direction == "LONG":
+                deadman_stop = _round_price(ccxt_sym, sl_px * (1.0 - deadman_pct))
+            else:
+                deadman_stop = _round_price(ccxt_sym, sl_px * (1.0 + deadman_pct))
+            deadman_id = _place_deadman_sl(
+                symbol, sl_side, deadman_stop, direction, fill_qty
+            )
+            if deadman_id:
+                result["deadman_sl_id"] = deadman_id
+                log.info(
+                    f"{symbol} DEADMAN SL placed: id={deadman_id} "
+                    f"stop={deadman_stop} (primary SL @ {sl_px}, +5% buffer)"
+                )
+            else:
+                log.warning(
+                    f"{symbol} DEADMAN SL placement returned no id — "
+                    f"trade proceeds without backup. Primary SL is sole guard."
+                )
+        except Exception as dme:
+            log.warning(
+                f"{symbol} DEADMAN SL placement raised: {dme} — "
+                f"trade proceeds without backup."
+            )
     else:
         # 🔴 FIX (Bug 3): SL failed after 3 retries → entry is naked.
         # Old behavior left the position unguarded with success=True. New:
@@ -1090,8 +1228,15 @@ def _diagnose_sl_verify_fail(symbol: str, order_id: str) -> dict:
         return {}
 
 
-def verify_existing_sl(symbol: str, sl_order_id: str, stop_price: float) -> dict:
-    """🟢 v5 Fix H: re-verify a previously-acked SL with 4-state result.
+def verify_existing_sl(
+    symbol: str,
+    sl_order_id: str,
+    stop_price: float,
+    client_oid: Optional[str] = None,
+    sl_side: Optional[str] = None,
+    direction: Optional[str] = None,
+) -> dict:
+    """🟢 v5 Fix H + v11 Fix O-2/O-4/O-5/O-8: re-verify a previously-acked SL with 4-state result.
 
     Used by bot.py's 60s deferred re-verify cleanup pass to determine whether a
     `sl_unverified=True` trade's SL is genuinely on Binance. Returns:
@@ -1132,18 +1277,51 @@ def verify_existing_sl(symbol: str, sl_order_id: str, stop_price: float) -> dict
     last_err: Optional[str] = None
     last_status: str = ""
     last_info: dict = {}
+    saw_2013 = False
     for attempt in range(1, 4):
         try:
             ex = _get_exchange()
             ccxt_sym = _symbol_to_ccxt(symbol)
-            o = ex.fetch_order(sl_order_id, ccxt_sym) or {}
+            # 🟢 v11 Fix O-2 (part A): try by orderId first. If -2013 fires,
+            # fall back to clientOrderId lookup (Binance's origClientOrderId
+            # query, ccxt accepts via params).
+            try:
+                o = ex.fetch_order(sl_order_id, ccxt_sym) or {}
+            except Exception as fe1:
+                err_str = str(fe1)
+                if "-2013" in err_str and client_oid:
+                    log.warning(
+                        f"verify_existing_sl({symbol},{sl_order_id}) "
+                        f"attempt={attempt} orderId -2013 — retrying via "
+                        f"clientOrderId={client_oid!r}"
+                    )
+                    saw_2013 = True
+                    try:
+                        o = ex.fetch_order(
+                            sl_order_id, ccxt_sym,
+                            params={"origClientOrderId": client_oid},
+                        ) or {}
+                    except Exception as fe2:
+                        log.warning(
+                            f"verify_existing_sl({symbol},{sl_order_id}) "
+                            f"cid fallback also raised: {fe2}"
+                        )
+                        raise fe2
+                else:
+                    if "-2013" in err_str:
+                        saw_2013 = True
+                    raise
             raw = (o.get("info") or {})
             unified = (o.get("status") or "").lower()
             raw_status = (raw.get("status") or "").lower()
             status = unified or raw_status
+            # 🟢 v11 Fix O-8: structured telemetry on every verify attempt
             log.info(
-                f"verify_existing_sl({symbol},{sl_order_id}) "
-                f"attempt={attempt} unified={unified!r} raw={raw_status!r}"
+                f"SL_FETCH_RAW symbol={symbol} id={sl_order_id} "
+                f"cid={raw.get('clientOrderId')!r} attempt={attempt} "
+                f"unified={unified!r} raw={raw_status!r} "
+                f"cancelReason={raw.get('cancelReason')!r} "
+                f"updateTime={raw.get('updateTime')!r}"
             )
             last_status, last_info = status, raw
             if status in ALIVE:
@@ -1154,25 +1332,24 @@ def verify_existing_sl(symbol: str, sl_order_id: str, stop_price: float) -> dict
                     "error": None,
                 }
             if status in DEAD:
+                # 🟢 v11 Fix O-5: capture cancellation reason from Binance
+                # `info.cancelReason` field. Surfaces WHY the SL died
+                # (USER_CANCELED, MARGIN_CALL, LIQUIDATION,
+                # EXPIRED_IN_MATCH, STOP_PRICE_TRIGGER, etc).
+                cancel_reason = raw.get("cancelReason") or raw.get("reason") or "UNKNOWN"
+                log.error(
+                    f"verify_existing_sl({symbol},{sl_order_id}) DEAD status="
+                    f"{status!r} cancelReason={cancel_reason!r} "
+                    f"raw_info_keys={list(raw.keys())!r}"
+                )
                 # 🟢 v7 Fix J-3: require POSITIVE confirmation that position
-                # is flat. The previous version treated `pos is None`
-                # (returned by get_open_position when the underlying
-                # fetch_positions call raised — transient 5xx, rate-limit,
-                # DNS hiccup) identically to a confirmed qty=0. That
-                # collapsed two very different states into "gone_clean",
-                # which downstream forced bars=MAX_HOLD ⇒ check_exits
-                # rebadged the close as "TIME" ⇒ user saw a healthy trade
-                # close at ~$0 P&L for ostensibly TIME reasons.
-                # New behavior: only declare gone_clean when get_open_position
-                # actually returned a position dict with qty<=0. On None
-                # (API failure), fall through to retry — never rush a
-                # force-close on uncertain evidence.
+                # is flat. Treat None (API failure) as 'unknown', retry.
                 pos = get_open_position(symbol)
                 if pos is None:
                     last_err = (
-                        f"DEAD status={status!r} but get_open_position "
-                        f"returned None (API failure?) — treating as "
-                        f"'unknown', will retry"
+                        f"DEAD status={status!r} reason={cancel_reason!r} "
+                        f"but get_open_position returned None (API failure?) "
+                        f"— treating as 'unknown', will retry"
                     )
                     log.warning(
                         f"verify_existing_sl({symbol},{sl_order_id}) {last_err}"
@@ -1183,6 +1360,7 @@ def verify_existing_sl(symbol: str, sl_order_id: str, stop_price: float) -> dict
                         "status": status,
                         "info": raw,
                         "error": None,
+                        "cancel_reason": cancel_reason,
                     }
                 else:
                     return {
@@ -1190,6 +1368,7 @@ def verify_existing_sl(symbol: str, sl_order_id: str, stop_price: float) -> dict
                         "status": status,
                         "info": raw,
                         "error": None,
+                        "cancel_reason": cancel_reason,
                     }
             else:
                 # Status neither ALIVE nor DEAD ⇒ empty / unknown ⇒ retry.
@@ -1198,13 +1377,51 @@ def verify_existing_sl(symbol: str, sl_order_id: str, stop_price: float) -> dict
                     f"raw={raw_status!r}"
                 )
         except Exception as e:
-            last_err = str(e)
+            err_str = str(e)
+            last_err = err_str
+            if "-2013" in err_str:
+                saw_2013 = True
             log.warning(
                 f"verify_existing_sl({symbol},{sl_order_id}) "
                 f"attempt={attempt}/3 fetch_order failed: {e}"
             )
         if attempt < 3:
-            time.sleep(2.0)
+            # 🟢 v11 Fix O-4: -2013-specific 10s backoff. Binance's
+            # internal id index can lag under load. Other errors keep 2s.
+            sleep_s = 10.0 if saw_2013 else 2.0
+            log.info(
+                f"verify_existing_sl({symbol},{sl_order_id}) "
+                f"backing off {sleep_s}s before attempt {attempt + 1}/3 "
+                f"(2013_seen={saw_2013})"
+            )
+            time.sleep(sleep_s)
+
+    # 🟢 v11 Fix O-2 (part B): before declaring 'unknown', try ATTRIBUTE-
+    # FINGERPRINT scan of open_orders. If Binance internally replaced the
+    # SL under a new id, the original id returns -2013 but a matching SL
+    # is on the book. Reuse _sl_already_at() — it already does type +
+    # price match. Extends with side check.
+    if sl_side and saw_2013:
+        try:
+            new_id = _sl_already_at(
+                symbol, sl_side, stop_price, tol_pct=0.2,
+                expected_type="reduceOnly",
+            )
+            if new_id:
+                log.warning(
+                    f"verify_existing_sl({symbol},{sl_order_id}) ATTRIBUTE "
+                    f"SCAN RESCUE — Binance has replacement SL on book "
+                    f"under new id={new_id}. Treating as alive."
+                )
+                return {
+                    "status_code": "alive",
+                    "status": "open",
+                    "info": {"_replaced_id": new_id},
+                    "error": None,
+                    "replaced_id": new_id,
+                }
+        except Exception as fe:
+            log.warning(f"verify_existing_sl attribute-scan rescue failed: {fe}")
     # 🟢 v9 Fix L diagnostic: dump full raw info on 'unknown' so we can
     # diagnose future false-positive emergency-closes. Past pattern showed
     # transient API quirks returning empty status; v9 captures the full
@@ -1290,12 +1507,33 @@ def _final_sl_lost_check(symbol: str, sl_order_id: str, ot: dict) -> str:
     except Exception as e:
         log.warning(f"{symbol} final-check open_orders failed: {e}")
 
+    # 🟢 v11 Fix O-2 (final-check side): try orderId, then clientOrderId
+    # fallback. If orderId returns -2013 and we have a stored cid, query
+    # via origClientOrderId.
+    client_oid = (ot or {}).get("exec_sl_cid")
     try:
         ex = _get_exchange()
         ccxt_sym = _symbol_to_ccxt(symbol)
-        o = ex.fetch_order(sl_order_id, ccxt_sym) or {}
+        try:
+            o = ex.fetch_order(sl_order_id, ccxt_sym) or {}
+        except Exception as ofe:
+            if "-2013" in str(ofe) and client_oid:
+                log.warning(
+                    f"{symbol} final-check: orderId -2013, trying "
+                    f"clientOrderId={client_oid!r}"
+                )
+                o = ex.fetch_order(
+                    sl_order_id, ccxt_sym,
+                    params={"origClientOrderId": client_oid},
+                ) or {}
+            else:
+                raise
         raw = o.get("info") or {}
         status = (o.get("status") or raw.get("status") or "").lower()
+        log.info(
+            f"{symbol} final-check FETCH_RAW status={status!r} "
+            f"cancelReason={raw.get('cancelReason')!r}"
+        )
         if status in (
             "open", "new", "untriggered", "active",
             "filled", "closed", "partially_filled",
@@ -1313,6 +1551,87 @@ def _final_sl_lost_check(symbol: str, sl_order_id: str, ot: dict) -> str:
         f"inconclusive AND position still open — declaring 'lost'"
     )
     return "lost"
+
+
+def _place_deadman_sl(
+    symbol: str,
+    sl_side: str,
+    stop_price: float,
+    direction: str,
+    qty: float,
+) -> Optional[str]:
+    """🟢 v11 Fix O-6: deadman-switch backup SL at 5% beyond primary.
+
+    Placed AFTER the primary reduceOnly SL succeeds. Uses
+    `closePosition=True STOP_MARKET` which:
+      - Auto-sizes to whatever position exists at trigger time (no qty)
+      - Auto-cancels server-side when position size hits zero
+      - Never canceled by bot logic unless bot calls cancel_open_orders
+        (only happens in execute_full_close which is intentional)
+
+    If Binance loses the primary SL (the -2013 root-cause path that
+    motivated v11), this deadman fires on catastrophic move and closes
+    the position. Worst-case loss becomes 5% beyond planned SL instead
+    of unbounded.
+
+    Best-effort. Returns id on success, None on failure. Failure here
+    does NOT block trade — primary SL is still the main guard.
+
+    NOTE: closePosition + reduceOnly are mutually exclusive on Binance
+    Futures. closePosition orders use a separate ledger from reduceOnly,
+    so primary (reduceOnly) + deadman (closePosition) coexist without
+    triggering -4130. closePosition orders ignore the `amount` field but
+    ccxt still requires it; pass position qty for API satisfaction.
+    """
+    try:
+        ex = _get_exchange()
+        ccxt_sym = _symbol_to_ccxt(symbol)
+        stop_price = _round_price(ccxt_sym, stop_price)
+        qty_r = _round_qty(ccxt_sym, qty) if qty and qty > 0 else 0.001
+
+        params = {
+            "stopPrice": stop_price,
+            "closePosition": True,
+        }
+        ps = _position_side_for(direction)
+        if ps:
+            params["positionSide"] = ps
+
+        # Deadman uses bot-tagged clientOrderId so it's identifiable in
+        # logs and Binance UI. Tag prefix `dms-` (DeadMan Switch).
+        _ts_ms = int(time.time() * 1000)
+        deadman_cid = f"dms-{symbol[:10]}-{_ts_ms}"[:36]
+        params["newClientOrderId"] = deadman_cid
+
+        log.info(
+            f"{symbol} placing DEADMAN SL: {sl_side} closePosition "
+            f"stop={stop_price} cid={deadman_cid}"
+        )
+        deadman_order = ex.create_order(
+            symbol=ccxt_sym,
+            type="stop_market",
+            side=sl_side,
+            amount=qty_r,
+            params=params,
+        )
+        deadman_id = deadman_order.get("id")
+        info = deadman_order.get("info") or {}
+        log.info(
+            f"DEADMAN_CREATE_RAW symbol={symbol} id={deadman_id} "
+            f"cid={info.get('clientOrderId', deadman_cid)!r} "
+            f"status={info.get('status')!r} "
+            f"closePosition={info.get('closePosition')!r} "
+            f"positionSide={info.get('positionSide')!r} "
+            f"stopPrice={info.get('stopPrice')!r}"
+        )
+        return deadman_id
+    except Exception as e:
+        # -4130 would mean a stale closePosition SL exists from a prior
+        # cycle. Should be rare since open_position runs cancel_open_orders
+        # inside the primary helper. Log + return None; primary SL still
+        # guards the trade.
+        log.warning(f"{symbol} _place_deadman_sl raised: {e}")
+        return None
 
 
 def _place_closeposition_sl_with_retry(
@@ -1422,13 +1741,27 @@ def _place_reduceonly_sl_with_retry(
         time.sleep(wait)
 
         try:
-            params = {"stopPrice": stop_price, "reduceOnly": True}
+            # 🟢 v11 Fix O-1: bot-generated clientOrderId for SL placement.
+            # Format: 'botsl-{SYMBOL}-{UTC_MS}'. Binance preserves this id
+            # in fetch_order params via `origClientOrderId` query — survives
+            # the -2013 'Order does not exist' lookup quirk on orderId.
+            # Max length 36 chars per Binance docs. Stripped of slashes.
+            _ts_ms = int(time.time() * 1000)
+            client_oid = f"botsl-{symbol[:10]}-{_ts_ms}"[:36]
+            # Pre-store in result so any success-path return preserves it.
+            result["sl_client_oid"] = client_oid
+            params = {
+                "stopPrice": stop_price,
+                "reduceOnly": True,
+                "newClientOrderId": client_oid,
+            }
             ps = _position_side_for("LONG" if sl_side == "sell" else "SHORT")
             if ps:
                 params["positionSide"] = ps
             log.info(
                 f"PLACING SL (attempt {attempt}/{max_attempts}): "
-                f"{sl_side} reduceOnly {ccxt_sym} qty={qty} @ {stop_price}"
+                f"{sl_side} reduceOnly {ccxt_sym} qty={qty} @ {stop_price} "
+                f"cid={client_oid}"
             )
             sl_order = ex.create_order(
                 symbol=ccxt_sym,
@@ -1438,6 +1771,21 @@ def _place_reduceonly_sl_with_retry(
                 params=params,
             )
             order_id = sl_order.get("id", "unknown")
+
+            # 🟢 v11 Fix O-8: telemetry — log raw create_order response so
+            # future SL_LOST events self-document. One line, key=value pairs.
+            _ci = sl_order.get("info") or {}
+            log.info(
+                f"SL_CREATE_RAW symbol={symbol} id={order_id} "
+                f"cid={_ci.get('clientOrderId', client_oid)!r} "
+                f"status={(sl_order.get('status') or '').lower()!r} "
+                f"origStatus={_ci.get('status')!r} "
+                f"reduceOnly={_ci.get('reduceOnly')!r} "
+                f"closePosition={_ci.get('closePosition')!r} "
+                f"positionSide={_ci.get('positionSide')!r} "
+                f"stopPrice={_ci.get('stopPrice')!r} "
+                f"updateTime={_ci.get('updateTime')!r}"
+            )
 
             # 🟢 FIX (v4 Fix A): inspect the create_order response status
             # BEFORE going to verify. If Binance synchronously rejected
