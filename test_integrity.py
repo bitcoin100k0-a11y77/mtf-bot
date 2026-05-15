@@ -413,6 +413,65 @@ check("v10 Fix M-2: tg_sl_lost suppressed when close was no-op",
       "SL_GHOST_RESOLVED" in bot_src and "close_no_op" in bot_src,
       "if close_full_position returned fill_price=0.0, position already 0 — replace alarming SL_LOST with informational notice")
 
+# ─────────────────────────────────────────────
+# v11 Fix O — root-cause defense-in-depth for SL_LOST
+# ─────────────────────────────────────────────
+check("v11 Fix O-1: clientOrderId generated for SL placement",
+      "newClientOrderId" in exec_src and "botsl-" in exec_src,
+      "every SL placement must include bot-generated newClientOrderId for fallback lookup")
+
+check("v11 Fix O-1: clientOrderId propagated through executor → bot",
+      "sl_client_oid" in exec_src and "exec_sl_cid" in bot_src,
+      "clientOrderId flows from placement helper → open_position result → ot dict")
+
+check("v11 Fix O-2: verify_existing_sl falls back to origClientOrderId on -2013",
+      "origClientOrderId" in exec_src,
+      "verify must retry via clientOrderId when orderId returns -2013")
+
+check("v11 Fix O-2: attribute-fingerprint rescue scan after -2013",
+      "ATTRIBUTE" in exec_src and "saw_2013" in exec_src,
+      "verify_existing_sl must scan open_orders by attribute when orderId is -2013")
+
+check("v11 Fix O-3: validate_position_side helper defined",
+      "def validate_position_side" in exec_src,
+      "hedge-mode mismatch validator required for fail-fast on misconfig")
+
+check("v11 Fix O-3: validate_position_side called at bot startup",
+      "validate_position_side" in bot_src and "HEDGE MODE MISMATCH" in bot_src,
+      "main() must call validator before first trade")
+
+check("v11 Fix O-4: -2013-specific backoff (10s) in verify_existing_sl",
+      "sleep_s = 10.0 if saw_2013" in exec_src,
+      "10s backoff on -2013 (Binance internal id-index lag); 2s otherwise")
+
+check("v11 Fix O-5: cancellation reason captured from fetch_order info",
+      "cancelReason" in exec_src,
+      "DEAD-status branch must capture Binance cancelReason field")
+
+check("v11 Fix O-6: _place_deadman_sl helper defined",
+      "def _place_deadman_sl" in exec_src,
+      "deadman-switch backup SL helper required")
+
+check("v11 Fix O-6: open_position places deadman SL after primary",
+      "DEADMAN" in exec_src and "deadman_sl_id" in exec_src,
+      "deadman backup placed after primary SL success")
+
+check("v11 Fix O-6: deadman_sl_id stored on trade dict",
+      "deadman_sl_id" in bot_src,
+      "bot.py tracks deadman SL id alongside primary")
+
+check("v11 Fix O-7: active liveness ping for non-sl_unverified trades",
+      "liveness ping" in bot_src,
+      "main loop must verify SL liveness on every open trade each cycle")
+
+check("v11 Fix O-8: SL_CREATE_RAW telemetry on placement",
+      "SL_CREATE_RAW" in exec_src,
+      "telemetry log on every SL create_order response")
+
+check("v11 Fix O-8: SL_FETCH_RAW telemetry on verify",
+      "SL_FETCH_RAW" in exec_src,
+      "telemetry log on every verify_existing_sl fetch_order attempt")
+
 check("v8 Fix K: closePosition helper delegates to reduceOnly STOP_LIMIT path",
       "closePosition wrapper" in exec_src and "_place_reduceonly_sl_with_retry" in exec_src,
       "closePosition path must forward to STOP_LIMIT helper")
@@ -438,12 +497,12 @@ check("v8 Fix K: post-partial re-arm called after TP2",
 # ─────────────────────────────────────────────
 print("\n[5] Structure Sanity")
 
-check(f"executor.py line count in range 580–2200 (got {len(exec_lines)})",
-      580 <= len(exec_lines) <= 2200,
+check(f"executor.py line count in range 580–2500 (got {len(exec_lines)})",
+      580 <= len(exec_lines) <= 2500,
       f"unexpected line count may indicate missing or duplicate content")
 
-check(f"bot.py line count in range 750–1900 (got {len(bot_lines)})",
-      750 <= len(bot_lines) <= 1900,
+check(f"bot.py line count in range 750–2100 (got {len(bot_lines)})",
+      750 <= len(bot_lines) <= 2100,
       f"unexpected line count may indicate missing or duplicate content")
 
 # Duplicate function definitions (the corruption we saw causes duplicates)
