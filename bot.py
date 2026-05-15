@@ -1210,18 +1210,37 @@ def main():
             executor.circuit_breaker.trip_reason = ""
             log.info("CB: Bot will resume trading on new UTC day.")
 
+    # 🟢 v10 Fix N: pre-fetch Binance wallet balance BEFORE the State log
+    # and the startup Telegram message, so they show REAL capital instead
+    # of the virtual Cfg.IC placeholder ($10,000). The full sync block
+    # below (peak/start_capital/CB baseline/reconcile) still runs after
+    # — this pre-fetch only ensures the visible state log + tg are honest.
+    try:
+        executor._get_exchange()
+        _pre_bal = executor.get_futures_balance()
+        if _pre_bal and _pre_bal > 0:
+            S["capital"] = _pre_bal
+            if not S.get("start_capital"):
+                S["start_capital"] = _pre_bal
+                S["peak"]          = _pre_bal
+    except Exception as _pe:
+        log.warning(f"Pre-fetch balance failed (will retry in main sync): {_pe}")
+
     log.info(f"State: checks={S['checks']} capital=${S['capital']:.2f} trades={len(S['trades'])}")
 
+    # 🟢 v10 Fix N: Telegram startup text refreshed to v10 reality —
+    # v4 TP fractions (40/30/30 @ 4.5R/7.2R/18R), 24/7 trading,
+    # cross-bar + 2-bar RSI momentum, STOP_MARKET reduceOnly SL.
     tg(f"<b>\U0001f680 MTF Bot v4.1 CHAMPION started</b>\n"
        f"Mode     : {mode}\n"
        f"Leverage : {executor.LEVERAGE}x\n"
        f"Pairs    : {', '.join(PAIRS)}\n"
-       f"TP 50/20/30% @ 4.5R / 7.2R / 30R\n"
-       f"Session  : 06–22 UTC only\n"
-       f"RSI mom  : 2-bar confirmation\n"
+       f"TP 40/30/30% @ 4.5R / 7.2R / 18R\n"
+       f"Session  : 24/7 (no time filter)\n"
+       f"RSI mom  : cross-bar + 2-bar confirmation\n"
        f"1H RSI   : filter active\n"
        f"Capital  : ${S['capital']:,.2f}\n"
-       f"Backtest : PF 18.13 | MaxDD 1.5% | WR 56%\n"
+       f"SL type  : reduceOnly STOP_MARKET (v10 Fix M)\n"
        f"Circuit  : DD {executor.DAILY_LOSS_LIMIT_PCT}% daily limit only "
        f"(consec-loss CB disabled — see executor.py)")
 
