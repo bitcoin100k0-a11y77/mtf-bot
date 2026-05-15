@@ -912,6 +912,12 @@ def execute_entry(sym: str, result: dict) -> dict:
         # Execution tracking
         "exec_order_id":  exec_result["order_id"],
         "exec_sl_id":     exec_result["sl_order_id"],
+        # 🟢 v11 Fix O-1: store bot-generated clientOrderId alongside Binance
+        # orderId. Used as fallback identifier when orderId returns -2013.
+        "exec_sl_cid":    exec_result.get("sl_client_oid"),
+        # 🟢 v11 Fix O-6: deadman-switch backup SL id (if placed). Fires
+        # at 5% beyond primary SL via closePosition=True STOP_MARKET.
+        "deadman_sl_id":  exec_result.get("deadman_sl_id"),
         "exec_fill_price": fill_price,
     }
 
@@ -1284,6 +1290,38 @@ def main():
             reconcile_open_trades(S)
             cleanup_orphan_sl_orders(S)  # 🔴 FIX: cancel stale SLs + re-place fresh ones
 
+            # 🟢 v11 Fix O-3: validate hedge-mode setting against fresh
+            # Binance probe + current position state. Likely root-cause
+            # of the SL_LOST cascade is a cached `_HEDGE_MODE=False` on
+            # an actual hedge-mode account → all orders placed without
+            # positionSide → Binance silently rejects post-ack → stored
+            # sl_id returns -2013 within 90s. Fail loud at startup so
+            # user can reconfigure account before trading.
+            try:
+                _vps = executor.validate_position_side(PAIRS[0] if PAIRS else "BTCUSDT")
+                log.info(f"O-3 validate_position_side: {_vps}")
+                if not _vps.get("ok"):
+                    log.critical(
+                        f"O-3 hedge-mode mismatch detected: {_vps.get('detail')!r}"
+                    )
+                    try:
+                        tg(
+                            f"<b>⚠️ HEDGE MODE MISMATCH</b>\n"
+                            f"{_vps.get('detail')}\n\n"
+                            f"Bot will continue but SL placements may "
+                            f"silently fail. Reconfigure Binance "
+                            f"positionMode and restart."
+                        )
+                    except Exception:
+                        pass
+                elif _vps.get("drift"):
+                    log.warning(
+                        f"O-3 hedge-mode cache drift corrected: "
+                        f"{_vps.get('detail')!r}"
+                    )
+            except Exception as _vpe:
+                log.warning(f"O-3 validate_position_side raised: {_vpe}")
+
     except Exception as e:
         log.error(f"Exchange init failed: {e}")
         tg(f"\u274c Exchange init failed: {e}\nBot will retry on first trade.")
@@ -1344,6 +1382,85 @@ def main():
                     # ── Exit check ─────────────────────────────────
                     ot = S["open_trades"].get(sym)
                     if ot:
+                        # 🟢 v11 Fix O-7: ACTIVE SL LIVENESS PING for every
+                        # open trade (not just sl_unverified). Once per
+                        # 5-min cycle, check the primary SL is still on
+                        # book. Catches silent Binance cancellations
+                        # within 5 min instead of waiting 90s grace.
+                        # Skipped when sl_unverified_until is set (that
+                        # path already runs its own re-verify below).
+                        if not ot.get("sl_unverified_until") and ot.get("exec_sl_id"):
+                            try:
+                                _ping = executor.verify_existing_sl(
+                                    sym,
+                                    ot["exec_sl_id"],
+                                    ot["sl"],
+                                    client_oid=ot.get("exec_sl_cid"),
+                                    sl_side="sell" if ot["dir"] == "LONG" else "buy",
+                                    direction=ot["dir"],
+                                )
+                                _ping_code = _ping.get("status_code", "unknown")
+                                if _ping.get("replaced_id"):
+                                    log.warning(
+                                        f"{sym} liveness ping: SL replaced "
+                                        f"on book {ot['exec_sl_id']} → "
+                                        f"{_ping['replaced_id']}"
+                                    )
+                                    ot["exec_sl_id"] = _ping["replaced_id"]
+                                if _ping_code == "lost":
+                                    log.error(
+                                        f"{sym} liveness ping: SL LOST "
+                                        f"detected EARLY (no grace wait). "
+                                        f"Attempting immediate re-arm."
+                                    )
+                                    try:
+                                        _rearm = executor.move_stop_loss(
+                                            symbol=sym,
+                                            direction=ot["dir"],
+                                            new_sl_price=ot["sl"],
+                                            remaining_qty=ot["size"] * ot.get("rem", 1.0),
+                                        )
+                                        if _rearm.get("success"):
+                                            new_id = _rearm.get("sl_order_id")
+                                            new_cid = _rearm.get("sl_client_oid")
+                                            log.warning(
+                                                f"{sym} liveness ping: SL "
+                                                f"re-armed early — new id={new_id}"
+                                            )
+                                            ot["exec_sl_id"] = new_id
+                                            if new_cid:
+                                                ot["exec_sl_cid"] = new_cid
+                                        else:
+                                            log.error(
+                                                f"{sym} liveness ping: early "
+                                                f"re-arm failed: {_rearm.get('error')}. "
+                                                f"Falling back to grace-window logic."
+                                            )
+                                            ot["sl_unverified_until"] = (
+                                                time.time() + 90.0
+                                            )
+                                            ot["sl_unverified_last_check"] = (
+                                                time.time() - 40.0
+                                            )
+                                    except Exception as _re:
+                                        log.error(
+                                            f"{sym} liveness ping re-arm raised: {_re}"
+                                        )
+                                elif _ping_code == "gone_clean":
+                                    log.warning(
+                                        f"{sym} liveness ping: position flat "
+                                        f"+ SL DEAD — clean exit elsewhere. "
+                                        f"Marking trade for cleanup next cycle."
+                                    )
+                                    ot["bars"] = max(ot.get("bars", 0), Cfg.MAX_HOLD)
+                                    ot["close_reason"] = "SL_AUTO_CANCEL_CLEAN"
+                                # alive / unknown → no-op
+                            except Exception as _pe:
+                                log.warning(
+                                    f"{sym} liveness ping raised: {_pe} "
+                                    f"— skipping this cycle"
+                                )
+
                         # 🟢 v4 Fix F: deferred re-verify of sl_unverified trades
                         # (set in execute_entry when executor's Fix A trust-id
                         # path fired — Binance write-acked the SL but read-side
@@ -1396,7 +1513,19 @@ def main():
                                 last_chk = ot.get("sl_unverified_last_check", 0)
                                 if now_ts - last_chk >= 60.0 and sl_id:
                                     ot["sl_unverified_last_check"] = now_ts
-                                    chk = executor.verify_existing_sl(sym, sl_id, ot["sl"])
+                                    # 🟢 v11 Fix O-1/O-2: pass clientOrderId
+                                    # + sl_side so verify can fall back to
+                                    # cid lookup on -2013 and attribute scan.
+                                    chk = executor.verify_existing_sl(
+                                        sym, sl_id, ot["sl"],
+                                        client_oid=ot.get("exec_sl_cid"),
+                                        sl_side="sell" if ot["dir"] == "LONG" else "buy",
+                                        direction=ot["dir"],
+                                    )
+                                    # If attribute scan rescued (returned
+                                    # alive with replaced_id), update tracking.
+                                    if chk.get("replaced_id"):
+                                        ot["exec_sl_id"] = chk["replaced_id"]
                                     code = chk.get("status_code", "unknown")
 
                                     if code == "alive":
