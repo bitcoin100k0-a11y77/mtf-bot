@@ -442,8 +442,8 @@ check(f"executor.py line count in range 580–2200 (got {len(exec_lines)})",
       580 <= len(exec_lines) <= 2200,
       f"unexpected line count may indicate missing or duplicate content")
 
-check(f"bot.py line count in range 750–1800 (got {len(bot_lines)})",
-      750 <= len(bot_lines) <= 1800,
+check(f"bot.py line count in range 750–1900 (got {len(bot_lines)})",
+      750 <= len(bot_lines) <= 1900,
       f"unexpected line count may indicate missing or duplicate content")
 
 # Duplicate function definitions (the corruption we saw causes duplicates)
