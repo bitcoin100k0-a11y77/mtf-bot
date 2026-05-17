@@ -461,11 +461,35 @@ def open_position(
             # catch most cases; this is the belt-and-suspenders execution gate.
             new_qty = _round_qty(ccxt_sym, max_affordable_notional / float(entry_price))
             if new_qty <= 0:
+                # 🟢 v12 Fix P-5: compute the leverage that WOULD make this
+                # trade fit, so user knows exactly what to set
+                # FUTURES_LEVERAGE to. Fetch min qty for context.
+                try:
+                    mkt = ex.market(ccxt_sym)
+                    min_qty_for_symbol = float(
+                        (mkt.get("limits") or {}).get("amount", {}).get("min") or 0.0
+                    )
+                    min_notional = min_qty_for_symbol * float(entry_price)
+                    if available > 0 and min_notional > 0:
+                        needed_lev = math.ceil(min_notional / (available * 0.88))
+                        suggest = (
+                            f"Min notional for {symbol} = ${min_notional:.2f} "
+                            f"(min qty {min_qty_for_symbol}). To trade this pair "
+                            f"on current wallet, set FUTURES_LEVERAGE>={needed_lev}x "
+                            f"OR add capital OR remove {symbol} from PAIRS."
+                        )
+                    else:
+                        suggest = (
+                            f"Fund wallet or raise FUTURES_LEVERAGE "
+                            f"or remove {symbol} from PAIRS."
+                        )
+                except Exception:
+                    suggest = "Fund wallet or raise FUTURES_LEVERAGE."
+
                 result["error"] = (
                     f"Wallet too small even after auto-resize "
                     f"(available ${available:.2f}, leverage {leverage}x, "
-                    f"min qty for {symbol} > affordable). "
-                    f"Fund wallet or raise FUTURES_LEVERAGE."
+                    f"min qty for {symbol} > affordable). {suggest}"
                 )
                 log.warning(result["error"])
                 return result
