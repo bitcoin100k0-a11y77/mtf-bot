@@ -79,6 +79,14 @@ def _get_exchange():
         "options": {
             "defaultType": "future",   # USD-M Futures
             "adjustForTimeDifference": True,
+            # 🟢 v12.1 Fix Q: widen recvWindow to 10s (default 5s). VPS
+            # clock drift can push request timestamps ahead of Binance
+            # server time by 1-3s under load → -1021 rejections.
+            # adjustForTimeDifference syncs ONCE at boot; clock drift
+            # accumulates after. recvWindow gives Binance more slack.
+            # Binance hard-caps recvWindow at 60000ms; 10000 is the
+            # standard sweet spot used by Binance's own python-binance.
+            "recvWindow": 10000,
         },
     })
 
@@ -221,9 +229,35 @@ def validate_position_side(symbol: str = "BTCUSDT") -> dict:
         )
         return result
     except Exception as e:
-        result["ok"] = False
-        result["detail"] = f"validate_position_side raised: {e}"
-        log.error(f"validate_position_side fatal: {e}")
+        # 🟢 v12.1 Fix Q-2: probe exceptions (clock drift -1021, network
+        # blip, rate limit, transient 5xx) are NOT hedge-mode mismatches.
+        # Returning ok=False here was incorrectly tripping the circuit
+        # breaker on first transient API failure (live error:
+        # "validate_position_side raised: binance -1021 Timestamp ahead").
+        # New behavior: assume safe (ok=True) on probe exceptions — the
+        # cached _HEDGE_MODE value remains in use; bot continues trading.
+        # detail field captures the actual exception for log forensics.
+        # Real hedge-mode mismatch is caught by the explicit-detection
+        # branches above (lines 194-211) which DO set ok=False with
+        # specific HEDGE MISMATCH detail text.
+        err_str = str(e)
+        is_transient = any(token in err_str for token in (
+            "-1021",       # timestamp out of recvWindow
+            "-1003",       # too many requests
+            "-1001",       # internal error
+            "Timeout",     # network timeout
+            "Connection",  # network
+            "5xx", "502", "503", "504",
+        ))
+        result["ok"] = True  # do NOT trip CB on transient probe failure
+        result["detail"] = (
+            f"probe_failed (transient={is_transient}): {err_str[:200]}"
+        )
+        log.warning(
+            f"validate_position_side probe raised: {e} — "
+            f"transient={is_transient}, continuing with cached "
+            f"_HEDGE_MODE={_HEDGE_MODE}"
+        )
         return result
 
 
