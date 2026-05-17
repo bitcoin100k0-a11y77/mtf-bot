@@ -87,6 +87,13 @@ class Cfg:
     # 🟢 v7 Fix J-2 retained — env-tunable. v8 default: 48 bars (4h) = v4 value.
     # Override per-VPS via MAX_HOLD_BARS env var. Each bar = 5-min candle.
     MAX_HOLD    = int(os.getenv("MAX_HOLD_BARS", "48"))
+
+    # 🟢 v12 Fix P-2: hard cap on concurrent open positions. Prevents
+    # margin exhaustion on small wallets where 3 simultaneous trades
+    # would leave the 3rd unable to place SL (-2019 / wallet-too-small).
+    # Default 2 — with 3 pairs allows 2 concurrent, blocks 3rd until one
+    # closes. Env-tunable via MAX_CONCURRENT_POSITIONS.
+    MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_POSITIONS", "2"))
     IC          = 10_000.0    # initial capital (virtual tracking)
     RISK_PCT    = 0.01        # 🔴 RISK: 1.0% risk per trade
 
@@ -452,7 +459,7 @@ def build(raw5m, raw15m, raw1h):
 
 # ─── Signal ───────────────────────────────────────────────────────────────────
 
-def get_signal(d5, capital):
+def get_signal(d5, capital, free_margin=None):
     """Generate entry signal from 5M indicator dataset.
 
     Returns dict with sig: LONG/SHORT/WATCH/CHOP and all trade parameters.
@@ -543,13 +550,16 @@ def get_signal(d5, capital):
         tp2 = c + atr_val * Cfg.TP2_MULT
         tp3 = c + atr_val * Cfg.TP3_MULT
         be  = c + atr_val * Cfg.SL_MULT
-        sz  = (capital * Cfg.RISK_PCT) / (atr_val * Cfg.SL_MULT)
+        # 🟢 v12 Fix P-1: size against live FREE margin when available
+        # (total capital may already be locked in concurrent positions).
+        # First-cycle / fallback: total capital.
+        _sizing_base = free_margin if (free_margin is not None and free_margin > 0) else capital
+        sz  = (_sizing_base * Cfg.RISK_PCT) / (atr_val * Cfg.SL_MULT)
         # 🔴 FIX (margin-cap): risk-based sz ignores leverage/wallet. On small
         # accounts during low-ATR regimes, notional can exceed wallet × leverage
-        # → pre-flight blocks trade. Cap sz so notional ≤ 88% of capital × leverage
-        # (synced with executor's Layer-B 88% — eliminates double-shrink between layers).
+        # → pre-flight blocks trade. Cap sz so notional ≤ 88% of FREE × leverage.
         _lev = max(executor.LEVERAGE, 1)
-        _max_notional = capital * _lev * 0.88
+        _max_notional = _sizing_base * _lev * 0.88
         _max_sz = _max_notional / c
         if sz > _max_sz:
             log.warning(
@@ -789,8 +799,29 @@ def tg_circuit_breaker(reason):
        f"To resume: set CIRCUIT_BREAKER_RESET=true in .env on the VPS, "
        f"then restart. Remove the var after trading resumes.")
 
+_TG_ERROR_LAST: dict = {}
+
 def tg_exec_error(sym, action, error):
-    """Send Telegram alert for execution errors."""
+    """🟢 v12 Fix P-4: per-(symbol, action) 30-min throttle to prevent
+    EXECUTION ERROR Telegram spam. When an underlying condition recurs
+    every cycle (wallet locked, persistent API failure), only first
+    alert fires; subsequent identical alerts within 30 min are
+    logged-only.
+
+    Throttle key: (sym, first 60 chars of action). State held in
+    module-level dict; resets on bot restart (intentional — restart
+    implies operator review).
+    """
+    key = (sym, str(action)[:60])
+    now = time.time()
+    last = _TG_ERROR_LAST.get(key, 0.0)
+    if now - last < 1800.0:
+        log.warning(
+            f"tg_exec_error THROTTLED ({sym}, {action}, last fired "
+            f"{(now-last):.0f}s ago): {error}"
+        )
+        return
+    _TG_ERROR_LAST[key] = now
     tg(f"<b>\u26a0\ufe0f EXECUTION ERROR</b>\n"
        f"Symbol : {sym}\n"
        f"Action : {action}\n"
@@ -1904,7 +1935,14 @@ def main():
 
                     # ── Entry check ────────────────────────────────
                     if sym not in S["open_trades"]:
-                        result = get_signal(d5, S["capital"])
+                        # 🟢 v12 Fix P-1: pass live FREE margin so sizing
+                        # accounts for capital already locked in concurrent
+                        # positions. Falls back to total capital inside helper
+                        # if free is missing/zero (first cycle).
+                        result = get_signal(
+                            d5, S["capital"],
+                            free_margin=S.get("live_free"),
+                        )
                         sig    = result["sig"]
                         m      = result.get("m", {})
                         log.info(f"{sym} ${px:,.2f} | 15M:{m.get('tr','?')} | "
@@ -1922,18 +1960,54 @@ def main():
                                     f"{sym} Signal {sig} BLOCKED — circuit breaker active: "
                                     f"{executor.circuit_breaker.trip_reason}"
                                 )
+                            # 🟢 v12 Fix P-2: concurrency cap
+                            elif len(S["open_trades"]) >= Cfg.MAX_CONCURRENT:
+                                log.info(
+                                    f"{sym} signal {sig} BLOCKED — concurrent "
+                                    f"cap {len(S['open_trades'])}/{Cfg.MAX_CONCURRENT} "
+                                    f"(env MAX_CONCURRENT_POSITIONS)"
+                                )
                             else:
-                                # 🔴 RISK: Execute real order
-                                new_ot = execute_entry(sym, result)
-                                if new_ot is not None:
-                                    S["open_trades"][sym] = new_ot
-                                    S["signals"] += 1
-                                    log.info(f"{sym} {sig} entry={new_ot['entry']:.2f} "
-                                             f"TP1={new_ot['tp1']:.2f} TP2={new_ot['tp2']:.2f} "
-                                             f"TP3={new_ot['tp3']:.2f} SL={new_ot['sl']:.2f}")
-                                    tg_opened(sym, new_ot)
-                                else:
-                                    log.warning(f"{sym} {sig} signal generated but execution failed/blocked")
+                                # 🟢 v12 Fix P-3: silent skip when free margin
+                                # < symbol's min notional. Prevents
+                                # tg_exec_error spam while wallet locked.
+                                _skip_for_min_notional = False
+                                try:
+                                    _ccxt_sym = sym.replace("USDT", "/USDT:USDT")
+                                    _mkt = executor._get_exchange().market(_ccxt_sym)
+                                    _min_qty = float(
+                                        (_mkt.get("limits") or {})
+                                        .get("amount", {}).get("min") or 0.0
+                                    )
+                                    _min_notional = _min_qty * px
+                                    _free = S.get("live_free") or S["capital"]
+                                    _max_aff = _free * max(executor.LEVERAGE, 1) * 0.88
+                                    if _max_aff < _min_notional:
+                                        log.info(
+                                            f"{sym} signal {sig} SKIPPED — free "
+                                            f"${_free:.2f} × {executor.LEVERAGE}x × 0.88 "
+                                            f"= ${_max_aff:.2f} < min notional "
+                                            f"${_min_notional:.2f}. Add capital or "
+                                            f"raise FUTURES_LEVERAGE."
+                                        )
+                                        _skip_for_min_notional = True
+                                except Exception as _mne:
+                                    log.warning(
+                                        f"{sym} P-3 min-notional pre-check failed: "
+                                        f"{_mne} — proceeding"
+                                    )
+                                if not _skip_for_min_notional:
+                                    # 🔴 RISK: Execute real order
+                                    new_ot = execute_entry(sym, result)
+                                    if new_ot is not None:
+                                        S["open_trades"][sym] = new_ot
+                                        S["signals"] += 1
+                                        log.info(f"{sym} {sig} entry={new_ot['entry']:.2f} "
+                                                 f"TP1={new_ot['tp1']:.2f} TP2={new_ot['tp2']:.2f} "
+                                                 f"TP3={new_ot['tp3']:.2f} SL={new_ot['sl']:.2f}")
+                                        tg_opened(sym, new_ot)
+                                    else:
+                                        log.warning(f"{sym} {sig} signal generated but execution failed/blocked")
                     else:
                         log.info(f"{sym} ${px:,.2f} | in trade")
 
