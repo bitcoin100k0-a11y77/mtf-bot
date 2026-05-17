@@ -472,6 +472,41 @@ check("v11 Fix O-8: SL_FETCH_RAW telemetry on verify",
       "SL_FETCH_RAW" in exec_src,
       "telemetry log on every verify_existing_sl fetch_order attempt")
 
+# ─────────────────────────────────────────────
+# v12 Fix P — margin-aware execution + Telegram noise gate
+# ─────────────────────────────────────────────
+check("v12 Fix P-1: get_signal accepts free_margin parameter",
+      "def get_signal(d5, capital, free_margin=None)" in bot_src,
+      "get_signal must accept free_margin for margin-aware sizing")
+
+check("v12 Fix P-1: sizing uses free_margin when available",
+      "_sizing_base = free_margin" in bot_src,
+      "sizing base should prefer live FREE margin over total capital")
+
+check("v12 Fix P-1: caller passes live_free to get_signal",
+      'free_margin=S.get("live_free")' in bot_src,
+      "main loop must pass S['live_free'] when calling get_signal")
+
+check("v12 Fix P-2: MAX_CONCURRENT cfg defined",
+      "MAX_CONCURRENT" in bot_src and "MAX_CONCURRENT_POSITIONS" in bot_src,
+      "Cfg.MAX_CONCURRENT must exist for concurrency cap")
+
+check("v12 Fix P-2: entry gate blocks at MAX_CONCURRENT",
+      "BLOCKED — concurrent" in bot_src and "Cfg.MAX_CONCURRENT" in bot_src,
+      "main loop must block new entries when at concurrency cap")
+
+check("v12 Fix P-3: min-notional silent-skip gate at entry",
+      "min notional" in bot_src and "_skip_for_min_notional" in bot_src,
+      "main loop must skip entry silently when free < min notional")
+
+check("v12 Fix P-4: tg_exec_error throttled per (sym, action)",
+      "_TG_ERROR_LAST" in bot_src and "THROTTLED" in bot_src,
+      "tg_exec_error must throttle duplicates to one per 30 min per key")
+
+check("v12 Fix P-5: executor error message suggests needed leverage",
+      "FUTURES_LEVERAGE>=" in exec_src,
+      "wallet-too-small error must compute and suggest needed leverage")
+
 check("v8 Fix K: closePosition helper delegates to reduceOnly STOP_LIMIT path",
       "closePosition wrapper" in exec_src and "_place_reduceonly_sl_with_retry" in exec_src,
       "closePosition path must forward to STOP_LIMIT helper")
