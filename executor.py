@@ -79,16 +79,34 @@ def _get_exchange():
         "options": {
             "defaultType": "future",   # USD-M Futures
             "adjustForTimeDifference": True,
-            # 🟢 v12.1 Fix Q: widen recvWindow to 10s (default 5s). VPS
-            # clock drift can push request timestamps ahead of Binance
-            # server time by 1-3s under load → -1021 rejections.
-            # adjustForTimeDifference syncs ONCE at boot; clock drift
-            # accumulates after. recvWindow gives Binance more slack.
-            # Binance hard-caps recvWindow at 60000ms; 10000 is the
-            # standard sweet spot used by Binance's own python-binance.
+            # 🟢 v12.1 Fix Q: widen recvWindow to 10s (default 5s).
             "recvWindow": 10000,
+            # 🟢 v12.3 Fix S: skip /sapi/v1/capital/config/getall during
+            # load_markets. ccxt 4.5.x calls fetch_currencies inside
+            # load_markets which hits a SAPI (spot) endpoint requiring
+            # different permissions. Futures-only bot doesn't need
+            # currency metadata. Skipping eliminates an auth surface
+            # AND the API call that was -1021-failing at boot.
+            "fetchCurrencies": False,
         },
     })
+
+    # 🟢 v12.3 Fix S: pre-sync time difference BEFORE load_markets.
+    # ccxt's adjustForTimeDifference runs DURING load_markets, but the
+    # first call inside load_markets uses the un-synced timestamp → -1021
+    # if VPS clock is drifted. load_time_difference() does one ping to
+    # Binance fapi /v1/time + caches the offset so subsequent calls
+    # auto-adjust. Wrap in try/except so a transient probe failure
+    # doesn't kill bot boot — we still have recvWindow=10000 fallback.
+    try:
+        offset = _exchange.load_time_difference()
+        log.info(f"Time difference loaded: {offset}ms (Binance vs VPS)")
+    except Exception as _tde:
+        log.warning(
+            f"load_time_difference failed ({_tde}) — relying on "
+            f"recvWindow=10000ms tolerance. If -1021 still fires, "
+            f"run `w32tm /resync /force` on VPS."
+        )
 
     # Load market metadata (precision, min qty, etc.)
     _exchange.load_markets()
