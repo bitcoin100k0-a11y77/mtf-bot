@@ -922,22 +922,32 @@ def cancel_open_orders(symbol: str) -> bool:
         ex = _get_exchange()
         ccxt_sym = _symbol_to_ccxt(symbol)
 
-        # 1) Atomic server-side cancel — single request, no per-order silent fails.
+        # 🟢 v12.2 Fix R-5: cancel BOTH regular orders AND algo (conditional)
+        # orders. Since Binance moved STOP_MARKET/TAKE_PROFIT_MARKET to the
+        # algoOrder endpoint, cancel_all_orders alone misses our SLs.
+        # Call cancel_all_orders once for each namespace.
+        # 1a) Atomic regular cancel
         try:
             ex.cancel_all_orders(ccxt_sym)
-            log.info(f"cancel_all_orders sent for {symbol}")
+            log.info(f"cancel_all_orders (regular) sent for {symbol}")
         except Exception as e:
-            # Fall back to iterate-and-cancel if the atomic endpoint misbehaves.
-            log.warning(f"cancel_all_orders failed for {symbol}: {e} — falling back to iterate")
+            log.warning(f"cancel_all_orders (regular) failed for {symbol}: {e}")
+        # 1b) Atomic algo cancel (where our SLs live)
+        try:
+            ex.cancel_all_orders(ccxt_sym, params={"trigger": True})
+            log.info(f"cancel_all_orders (algo) sent for {symbol}")
+        except Exception as e:
+            # Fall back to iterate-and-cancel for algo orders
+            log.warning(f"cancel_all_orders (algo) failed for {symbol}: {e} — falling back to iterate")
             try:
-                for order in ex.fetch_open_orders(ccxt_sym):
+                for order in ex.fetch_open_orders(ccxt_sym, params={"trigger": True}):
                     try:
-                        ex.cancel_order(order["id"], ccxt_sym)
-                        log.info(f"Cancelled order {order['id']} for {symbol}")
+                        ex.cancel_order(order["id"], ccxt_sym, params={"trigger": True})
+                        log.info(f"Cancelled algo order {order['id']} for {symbol}")
                     except Exception as ce:
-                        log.warning(f"Failed to cancel order {order['id']}: {ce}")
+                        log.warning(f"Failed to cancel algo order {order['id']}: {ce}")
             except Exception as fe:
-                log.error(f"Iterate-cancel fallback also failed for {symbol}: {fe}")
+                log.error(f"Iterate-cancel (algo) fallback failed for {symbol}: {fe}")
                 return False
 
         # 2) Verify — poll until open_orders truly empty or timeout (~1.5s).
@@ -945,7 +955,7 @@ def cancel_open_orders(symbol: str) -> bool:
         deadline = time.time() + 1.5
         while time.time() < deadline:
             try:
-                remaining = ex.fetch_open_orders(ccxt_sym)
+                remaining = ex.fetch_open_orders(ccxt_sym, params={"trigger": True})
             except Exception as pe:
                 log.warning(f"Post-cancel poll failed for {symbol}: {pe}")
                 remaining = None
@@ -956,7 +966,7 @@ def cancel_open_orders(symbol: str) -> bool:
 
         # Fell through — something is still pending. Caller must decide.
         try:
-            still = ex.fetch_open_orders(ccxt_sym)
+            still = ex.fetch_open_orders(ccxt_sym, params={"trigger": True})
             log.warning(
                 f"Cancel verification timeout for {symbol}: {len(still)} order(s) still open"
             )
@@ -979,7 +989,7 @@ def _dump_open_orders_on_4130(symbol: str, ctx: str) -> None:
     try:
         ex = _get_exchange()
         ccxt_sym = _symbol_to_ccxt(symbol)
-        open_orders = ex.fetch_open_orders(ccxt_sym)
+        open_orders = ex.fetch_open_orders(ccxt_sym, params={"trigger": True})
         log.error(
             f"{symbol} -4130 diagnostic ({ctx}) — {len(open_orders)} open orders:"
         )
@@ -1094,7 +1104,7 @@ def _fetch_current_sl(
     try:
         ex = _get_exchange()
         ccxt_sym = _symbol_to_ccxt(symbol)
-        for o in ex.fetch_open_orders(ccxt_sym):
+        for o in ex.fetch_open_orders(ccxt_sym, params={"trigger": True}):
             info = o.get("info", {}) or {}
             o_type = (info.get("type") or o.get("type") or "").upper()
             o_side = (info.get("side") or o.get("side") or "").lower()
@@ -1175,7 +1185,7 @@ def _verify_sl_placed(
         # Fast path: scan by exact order id when caller provides it.
         if expected_id:
             try:
-                for o in ex.fetch_open_orders(ccxt_sym):
+                for o in ex.fetch_open_orders(ccxt_sym, params={"trigger": True}):
                     if str(o.get("id")) == str(expected_id):
                         if _order_matches_type(o, expected_type):
                             log.info(
@@ -1206,7 +1216,7 @@ def _verify_sl_placed(
             return True
         time.sleep(poll_delay)
     # 🔴 FIX (v3 Fix 5 / v5 Fix H): direct fetch_order rescue. open_orders list
-    # can lag the order's actual state by seconds under load. fetch_order(id) is
+    # can lag the order's actual state by seconds under load. fetch_order(id, params={"trigger": True}) is
     # authoritative — if Binance has the order with active status, return True.
     # v5: 3 attempts × 2s — a single transient 5xx during this rescue used to
     # push the caller into the sl_unverified path unnecessarily.
@@ -1214,7 +1224,7 @@ def _verify_sl_placed(
         for rescue_attempt in range(1, 4):
             try:
                 ex2 = _get_exchange()
-                o = ex2.fetch_order(expected_id, ccxt_sym) or {}
+                o = ex2.fetch_order(expected_id, ccxt_sym, params={"trigger": True}) or {}
                 raw = o.get("info") or {}
                 status = (
                     (o.get("status") or "").lower()
@@ -1271,7 +1281,7 @@ def _diagnose_sl_verify_fail(symbol: str, order_id: str) -> dict:
     try:
         ex = _get_exchange()
         ccxt_sym = _symbol_to_ccxt(symbol)
-        o = ex.fetch_order(order_id, ccxt_sym) or {}
+        o = ex.fetch_order(order_id, ccxt_sym, params={"trigger": True}) or {}
         info = o.get("info", {}) or {}
         # 🟢 FIX (v4 Fix D): extended telemetry. Adds clientId, raw vs unified
         # status, updateTime, and local time delta so the next failure has
@@ -1323,7 +1333,7 @@ def verify_existing_sl(
                        attempts. Caller MUST NOT emergency-close on this.
 
     Implementation:
-      - 3 attempts × 2s backoff. Each attempt calls fetch_order(id, sym) and
+      - 3 attempts × 2s backoff. Each attempt calls fetch_order(id, sym, params={"trigger": True}) and
         inspects both ccxt's unified `status` and the Binance raw `info.status`.
       - On exception or empty status, retry. Only after all attempts
         inconclusive do we return 'unknown'.
@@ -1354,7 +1364,7 @@ def verify_existing_sl(
             # fall back to clientOrderId lookup (Binance's origClientOrderId
             # query, ccxt accepts via params).
             try:
-                o = ex.fetch_order(sl_order_id, ccxt_sym) or {}
+                o = ex.fetch_order(sl_order_id, ccxt_sym, params={"trigger": True}) or {}
             except Exception as fe1:
                 err_str = str(fe1)
                 if "-2013" in err_str and client_oid:
@@ -1521,7 +1531,7 @@ def _final_sl_lost_check(symbol: str, sl_order_id: str, ot: dict) -> str:
     truly lost.
 
     Returns one of:
-      - 'alive' : SL is on the order book under any id, OR fetch_order(id)
+      - 'alive' : SL is on the order book under any id, OR fetch_order(id, params={"trigger": True})
                   reports an active/filled status. Resolve.
       - 'flat'  : Position is already at zero size. Nothing to protect; the
                   trade closed by another path. Resolve silently.
@@ -1556,7 +1566,7 @@ def _final_sl_lost_check(symbol: str, sl_order_id: str, ot: dict) -> str:
     try:
         ex = _get_exchange()
         ccxt_sym = _symbol_to_ccxt(symbol)
-        for o in ex.fetch_open_orders(ccxt_sym):
+        for o in ex.fetch_open_orders(ccxt_sym, params={"trigger": True}):
             info = o.get("info") or {}
             otype = (info.get("type") or o.get("type") or "").upper()
             if otype not in ("STOP_MARKET", "STOP"):
@@ -1583,7 +1593,7 @@ def _final_sl_lost_check(symbol: str, sl_order_id: str, ot: dict) -> str:
         ex = _get_exchange()
         ccxt_sym = _symbol_to_ccxt(symbol)
         try:
-            o = ex.fetch_order(sl_order_id, ccxt_sym) or {}
+            o = ex.fetch_order(sl_order_id, ccxt_sym, params={"trigger": True}) or {}
         except Exception as ofe:
             if "-2013" in str(ofe) and client_oid:
                 log.warning(
@@ -2065,7 +2075,7 @@ def _place_reduceonly_sl_with_retry(
 
     try:
         pos = get_open_position(symbol)
-        oo = len(ex.fetch_open_orders(ccxt_sym))
+        oo = len(ex.fetch_open_orders(ccxt_sym, params={"trigger": True}))
         log.error(
             f"-4130 exhausted on {symbol} (reduceOnly): hedge={_get_hedge_mode()} "
             f"pos_qty={pos['qty'] if pos else 0} open_orders={oo} "
