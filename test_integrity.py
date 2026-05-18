@@ -507,6 +507,21 @@ check("v12 Fix P-5: executor error message suggests needed leverage",
       "FUTURES_LEVERAGE>=" in exec_src,
       "wallet-too-small error must compute and suggest needed leverage")
 
+# ─────────────────────────────────────────────
+# v12.2 Fix R — Binance -4120 Algo Order migration
+# ─────────────────────────────────────────────
+check("v12.2 Fix R-1: requirements pins ccxt 4.5.54",
+      "ccxt==4.5.54" in open("requirements.txt").read(),
+      "ccxt must be 4.5.54+ for fapiPrivatePostAlgoOrder auto-routing")
+
+check("v12.2 Fix R-2/3/4: all SL ccxt calls pass trigger=True",
+      exec_src.count('params={"trigger": True}') >= 10,
+      "every SL fetch_order / fetch_open_orders / cancel_order must include trigger flag to hit algo endpoints")
+
+check("v12.2 Fix R-5: cancel_open_orders cancels both regular and algo namespaces",
+      "cancel_all_orders (regular)" in exec_src and "cancel_all_orders (algo)" in exec_src,
+      "cancel_open_orders must hit BOTH endpoints — regular cancel_all_orders misses algo SL orders")
+
 check("v8 Fix K: closePosition helper delegates to reduceOnly STOP_LIMIT path",
       "closePosition wrapper" in exec_src and "_place_reduceonly_sl_with_retry" in exec_src,
       "closePosition path must forward to STOP_LIMIT helper")
