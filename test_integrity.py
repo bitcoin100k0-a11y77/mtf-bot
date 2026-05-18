@@ -511,7 +511,7 @@ check("v12 Fix P-5: executor error message suggests needed leverage",
 # v12.2 Fix R — Binance -4120 Algo Order migration
 # ─────────────────────────────────────────────
 check("v12.2 Fix R-1: requirements pins ccxt 4.5.54",
-      "ccxt==4.5.54" in open("requirements.txt").read(),
+      "ccxt==4.5.54" in open("requirements.txt", encoding="utf-8").read(),
       "ccxt must be 4.5.54+ for fapiPrivatePostAlgoOrder auto-routing")
 
 check("v12.2 Fix R-2/3/4: all SL ccxt calls pass trigger=True",
