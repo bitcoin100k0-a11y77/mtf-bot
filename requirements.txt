@@ -1,5 +1,5 @@
 # Champion v4.1 — Live Execution Dependencies
 # ⚠️ Pin versions to avoid breaking changes in production
 
-ccxt==4.4.35           # Exchange API (Binance Futures)
+ccxt==4.5.54           # 🟢 v12.2 Fix R: bumped 4.4.35→4.5.54 — Binance disabled STOP_MARKET/TAKE_PROFIT_MARKET on /fapi/v1/order, requires /fapi/v1/algoOrder. ccxt 4.5.x routes conditional orders to fapiPrivatePostAlgoOrder automatically.
 requests==2.32.3       # HTTP client (Telegram, Binance public API)
